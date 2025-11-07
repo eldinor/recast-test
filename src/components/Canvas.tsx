@@ -98,6 +98,7 @@ export function Canvas() {
 
       const maxAgentRadius = 0.15;
       const AGENT_COUNT = 20;
+      const MAX_CROWD_CAPACITY = 100; // Allow up to 100 agents total (initial + dynamically added)
 
       const navmeshParameters = {
         cs: 0.1,
@@ -177,10 +178,10 @@ export function Canvas() {
       const debugNavMesh2 = navigationPlugin.createDebugNavMesh(scene);
       debugNavMesh2.material = material;
 
-      // Create crowd with 20 agents
-      const crowd = navigationPlugin.createCrowd(AGENT_COUNT, maxAgentRadius, scene);
+      // Create crowd with capacity for initial agents + dynamically added ones
+      const crowd = navigationPlugin.createCrowd(MAX_CROWD_CAPACITY, maxAgentRadius, scene);
       crowdRef.current = crowd;
-      console.log("Crowd created:", crowd);
+      console.log("Crowd created with capacity:", MAX_CROWD_CAPACITY);
 
       // Create 20 agents with visual representation and assign them homes/workplaces
       const agents = [];
@@ -209,6 +210,13 @@ export function Canvas() {
           agentTransform
         );
 
+        console.log(`Agent ${i}: crowd.addAgent returned index ${agentIndex}`);
+
+        if (agentIndex === -1) {
+          console.error(`Failed to add agent ${i} to crowd! Position:`, startPosition);
+          continue; // Skip this agent
+        }
+
         // Create visual mesh for agent
         const agentMesh = createAgentMesh(agentParams, agentIndex, scene);
         agentMesh.parent = agentTransform;
@@ -231,7 +239,7 @@ export function Canvas() {
         };
         workers.push(worker);
 
-        console.log(`Agent ${i} created at house ${houses.indexOf(house)}, workplace: ${worker.workplace ? 'yes' : 'no'}`);
+        console.log(`Agent ${i} created successfully with agentIndex ${agentIndex} at house ${houses.indexOf(house)}, workplace: ${worker.workplace ? 'yes' : 'no'}`);
       }
 
       workersRef.current = workers;
@@ -243,14 +251,36 @@ export function Canvas() {
           const pickResult = pointerInfo.pickInfo;
           if (pickResult?.hit && pickResult.pickedMesh) {
             const meshName = pickResult.pickedMesh.name;
+            console.log("Clicked on mesh:", meshName, "isPickable:", pickResult.pickedMesh.isPickable);
+
+            // Check if clicked on agent mesh (format: "agent-0", "agent-1", etc.)
             if (meshName.startsWith("agent-")) {
-              const agentIndex = parseInt(meshName.split("-")[1]);
-              const worker = workers.find(w => w.agentIndex === agentIndex);
-              if (worker) {
-                setSelectedWorker(worker);
-                setShowWorkerPanel(true);
+              // Extract the number after "agent-" using regex (handles negative numbers too)
+              const match = meshName.match(/agent-(-?\d+)/);
+              if (match && match[1]) {
+                const agentIndex = parseInt(match[1]);
+                console.log("Agent index:", agentIndex, "Workers count:", workersRef.current.length);
+
+                if (agentIndex === -1) {
+                  console.error("Clicked on agent with invalid index -1. This agent was not properly created.");
+                  return;
+                }
+
+                const worker = workersRef.current.find(w => w.agentIndex === agentIndex);
+                if (worker) {
+                  console.log("Found worker:", worker);
+                  setSelectedWorker(worker);
+                  setShowWorkerPanel(true);
+                } else {
+                  console.log("Worker not found for agent index:", agentIndex);
+                  console.log("Available workers:", workersRef.current.map(w => w.agentIndex));
+                }
+              } else {
+                console.log("Could not extract agent index from:", meshName);
               }
             }
+          } else {
+            console.log("No mesh picked or no hit");
           }
         }
       });
@@ -326,6 +356,7 @@ export function Canvas() {
       const house = MeshBuilder.CreateBox(`house-${index}`, { width: 0.75, height: 0.5, depth: 0.75 }, scene);
       house.position = new Vector3(x, 0.25, z);
       house.material = houseMat;
+      house.isPickable = false;
       newBuilding = { mesh: house, entranceZone: new Vector3(x + 0.8, 0, z), type: "house" };
       housesRef.current.push(newBuilding);
     } else if (type === "workplace") {
@@ -335,6 +366,7 @@ export function Canvas() {
       const workplace = MeshBuilder.CreateCylinder(`workplace-${index}`, { height: 0.75, diameter: 0.75 }, scene);
       workplace.position = new Vector3(x, 0.375, z);
       workplace.material = workMat;
+      workplace.isPickable = false;
       newBuilding = { mesh: workplace, entranceZone: new Vector3(x + 0.8, 0, z), type: "workplace" };
       workplacesRef.current.push(newBuilding);
     } else if (type === "tavern") {
@@ -348,6 +380,7 @@ export function Canvas() {
       }, scene);
       tavern.position = new Vector3(x, 0.3, z);
       tavern.material = tavernMat;
+      tavern.isPickable = false;
       newBuilding = { mesh: tavern, entranceZone: new Vector3(x + 0.8, 0, z), type: "tavern" };
       tavernsRef.current.push(newBuilding);
     } else {
@@ -357,6 +390,7 @@ export function Canvas() {
       const clinic = MeshBuilder.CreateBox(`clinic-${index}`, { width: 0.75, height: 0.5, depth: 0.75 }, scene);
       clinic.position = new Vector3(x, 0.25, z);
       clinic.material = clinicMat;
+      clinic.isPickable = false;
       newBuilding = { mesh: clinic, entranceZone: new Vector3(x + 0.8, 0, z), type: "clinic" };
       clinicsRef.current.push(newBuilding);
     }
@@ -412,6 +446,13 @@ export function Canvas() {
     const agentTransform = new TransformNode(`agent-transform-${workersRef.current.length}`, scene);
     const agentIndex = crowd.addAgent(startPosition, agentParams, agentTransform);
 
+    console.log(`addWorker: crowd.addAgent returned index ${agentIndex}`);
+
+    if (agentIndex === -1) {
+      console.error(`Failed to add worker to crowd! Position:`, startPosition);
+      return;
+    }
+
     const agentMesh = createAgentMesh(agentParams, agentIndex, scene);
     agentMesh.parent = agentTransform;
     agentMesh.isPickable = true; // Make sure it's clickable
@@ -428,7 +469,7 @@ export function Canvas() {
     };
     workersRef.current.push(worker);
 
-    console.log(`Added worker ${agentIndex} at house`);
+    console.log(`Added worker with agentIndex ${agentIndex} at house`);
   };
 
   const changeWorkerWorkplace = (worker: Worker, workplace: Building | null) => {
@@ -666,6 +707,7 @@ function createStaticGround(scene: Scene) {
   mat1.diffuseColor = new Color3(0.8, 1, 1);
 
   const ground = CreateGround("ground1", { width: 20, height: 20 }, scene);
+  ground.isPickable = false; // Don't block clicks on agents
   return ground;
 }
 
@@ -751,6 +793,7 @@ function createHouses(scene: Scene, count: number): Building[] {
     const house = MeshBuilder.CreateBox(`house-${i}`, { width: 0.75, height: 0.5, depth: 0.75 }, scene);
     house.position = new Vector3(x, 0.25, z);
     house.material = houseMat;
+    house.isPickable = false;
 
     const entranceZone = new Vector3(x + 0.8, 0, z);
 
@@ -784,6 +827,7 @@ function createWorkplaces(scene: Scene, count: number): Building[] {
     const workplace = MeshBuilder.CreateCylinder(`workplace-${i}`, { height: 0.75, diameter: 0.75 }, scene);
     workplace.position = new Vector3(x, 0.375, z);
     workplace.material = workMat;
+    workplace.isPickable = false;
 
     const entranceZone = new Vector3(x + 0.8, 0, z);
 
@@ -821,6 +865,7 @@ function createTaverns(scene: Scene, count: number): Building[] {
     }, scene);
     tavern.position = new Vector3(x, 0.3, z);
     tavern.material = tavernMat;
+    tavern.isPickable = false;
 
     const entranceZone = new Vector3(x + 0.8, 0, z);
 
@@ -855,6 +900,7 @@ function createClinics(scene: Scene, count: number): Building[] {
     const clinic = MeshBuilder.CreateBox(`clinic-${i}`, { width: 0.75, height: 0.5, depth: 0.75 }, scene);
     clinic.position = new Vector3(x, 0.25, z);
     clinic.material = clinicMat;
+    clinic.isPickable = false;
 
     const entranceZone = new Vector3(x + 0.8, 0, z);
 
