@@ -39,6 +39,8 @@ export function Canvas() {
   // UI State
   const [selectedWorker, setSelectedWorker] = useState<Worker | null>(null);
   const [showWorkerPanel, setShowWorkerPanel] = useState(false);
+  const [selectedBuilding, setSelectedBuilding] = useState<Building | null>(null);
+  const [showBuildingPanel, setShowBuildingPanel] = useState(false);
 
   // Update worker panel in real-time
   useEffect(() => {
@@ -54,6 +56,18 @@ export function Canvas() {
       return () => clearInterval(interval);
     }
   }, [showWorkerPanel, selectedWorker]);
+
+  // Update building panel in real-time
+  useEffect(() => {
+    if (showBuildingPanel && selectedBuilding) {
+      const interval = setInterval(() => {
+        // Force re-render to update worker counts
+        setSelectedBuilding({ ...selectedBuilding });
+      }, 500); // Update every 500ms
+
+      return () => clearInterval(interval);
+    }
+  }, [showBuildingPanel, selectedBuilding]);
 
   // Initialize scene only once
   useEffect(() => {
@@ -202,9 +216,19 @@ export function Canvas() {
           separationWeight: 1.0,
         } as IAgentParameters;
 
-        // Assign a house to each agent
-        const house = houses[i % houses.length];
-        const startPosition = navigationPlugin.getClosestPoint(house.entranceZone);
+        // Assign a house to each agent (respecting capacity)
+        let house: Building | null = null;
+        for (const h of houses) {
+          if (h.workers.length < h.capacity) {
+            house = h;
+            break;
+          }
+        }
+
+        // If no house available, worker is homeless (starts at random position)
+        const startPosition = house
+          ? navigationPlugin.getClosestPoint(house.entranceZone)
+          : navigationPlugin.getClosestPoint(new Vector3((Math.random() - 0.5) * 16, 0, (Math.random() - 0.5) * 16));
 
         // Create agent transform
         const agentTransform = new TransformNode(`agent-transform-${i}`, scene);
@@ -231,13 +255,22 @@ export function Canvas() {
 
         agents.push({ agentIndex, agentMesh, agentTransform });
 
+        // Assign workplace (respecting capacity)
+        let workplace: Building | null = null;
+        for (const w of workplaces) {
+          if (w.workers.length < w.capacity) {
+            workplace = w;
+            break;
+          }
+        }
+
         // Create worker with assigned buildings
         // Randomize initial state timer so agents don't all move at once
         const randomTimer = Math.floor(Math.random() * 3);
         const worker: Worker = {
           agentIndex,
           house,
-          workplace: i < workplaces.length * 5 ? workplaces[i % workplaces.length] : null,
+          workplace,
           happiness: 50,
           health: 100,
           // Initialize needs (start with random values between 50-100)
@@ -250,7 +283,15 @@ export function Canvas() {
         };
         workers.push(worker);
 
-        console.log(`Agent ${i} created successfully with agentIndex ${agentIndex} at house ${houses.indexOf(house)}, workplace: ${worker.workplace ? 'yes' : 'no'}`);
+        // Add worker to building arrays
+        if (house) {
+          house.workers.push(agentIndex);
+        }
+        if (workplace) {
+          workplace.workers.push(agentIndex);
+        }
+
+        console.log(`Agent ${i} created successfully with agentIndex ${agentIndex} at house ${house ? houses.indexOf(house) : 'HOMELESS'}, workplace: ${workplace ? workplaces.indexOf(workplace) : 'UNEMPLOYED'}`);
       }
 
       workersRef.current = workers;
@@ -288,6 +329,32 @@ export function Canvas() {
                 }
               } else {
                 console.log("Could not extract agent index from:", meshName);
+              }
+            }
+            // Check if clicked on a building
+            else if (meshName.startsWith("house-") || meshName.startsWith("workplace-") ||
+                     meshName.startsWith("tavern-") || meshName.startsWith("clinic-") ||
+                     meshName.startsWith("restaurant-") || meshName.startsWith("bathhouse-")) {
+              // Extract building type and index
+              const match = meshName.match(/^(\w+)-(\d+)$/);
+              if (match) {
+                const buildingType = match[1];
+                const buildingIndex = parseInt(match[2]);
+
+                let building: Building | null = null;
+                if (buildingType === "house") building = housesRef.current[buildingIndex];
+                else if (buildingType === "workplace") building = workplacesRef.current[buildingIndex];
+                else if (buildingType === "tavern") building = tavernsRef.current[buildingIndex];
+                else if (buildingType === "clinic") building = clinicsRef.current[buildingIndex];
+                else if (buildingType === "restaurant") building = restaurantsRef.current[buildingIndex];
+                else if (buildingType === "bathhouse") building = bathhousesRef.current[buildingIndex];
+
+                if (building) {
+                  console.log("Clicked on building:", buildingType, buildingIndex);
+                  setSelectedBuilding(building);
+                  setShowBuildingPanel(true);
+                  setShowWorkerPanel(false); // Close worker panel
+                }
               }
             }
           } else {
@@ -369,8 +436,8 @@ export function Canvas() {
       const house = MeshBuilder.CreateBox(`house-${index}`, { width: 0.75, height: 0.5, depth: 0.75 }, scene);
       house.position = new Vector3(x, 0.25, z);
       house.material = houseMat;
-      house.isPickable = false;
-      newBuilding = { mesh: house, entranceZone: new Vector3(x + 0.8, 0, z), type: "house" };
+      house.isPickable = true; // Make buildings clickable
+      newBuilding = { mesh: house, entranceZone: new Vector3(x + 0.8, 0, z), type: "house", workers: [], capacity: 4 };
       housesRef.current.push(newBuilding);
     } else if (type === "workplace") {
       const index = workplacesRef.current.length;
@@ -379,8 +446,8 @@ export function Canvas() {
       const workplace = MeshBuilder.CreateCylinder(`workplace-${index}`, { height: 0.75, diameter: 0.75 }, scene);
       workplace.position = new Vector3(x, 0.375, z);
       workplace.material = workMat;
-      workplace.isPickable = false;
-      newBuilding = { mesh: workplace, entranceZone: new Vector3(x + 0.8, 0, z), type: "workplace" };
+      workplace.isPickable = true; // Make buildings clickable
+      newBuilding = { mesh: workplace, entranceZone: new Vector3(x + 0.8, 0, z), type: "workplace", workers: [], capacity: 5 };
       workplacesRef.current.push(newBuilding);
     } else if (type === "tavern") {
       const index = tavernsRef.current.length;
@@ -393,8 +460,8 @@ export function Canvas() {
       }, scene);
       tavern.position = new Vector3(x, 0.3, z);
       tavern.material = tavernMat;
-      tavern.isPickable = false;
-      newBuilding = { mesh: tavern, entranceZone: new Vector3(x + 0.8, 0, z), type: "tavern" };
+      tavern.isPickable = true; // Make buildings clickable
+      newBuilding = { mesh: tavern, entranceZone: new Vector3(x + 0.8, 0, z), type: "tavern", workers: [], capacity: 999 };
       tavernsRef.current.push(newBuilding);
     } else if (type === "clinic") {
       const index = clinicsRef.current.length;
@@ -403,8 +470,8 @@ export function Canvas() {
       const clinic = MeshBuilder.CreateBox(`clinic-${index}`, { width: 0.75, height: 0.5, depth: 0.75 }, scene);
       clinic.position = new Vector3(x, 0.25, z);
       clinic.material = clinicMat;
-      clinic.isPickable = false;
-      newBuilding = { mesh: clinic, entranceZone: new Vector3(x + 0.8, 0, z), type: "clinic" };
+      clinic.isPickable = true; // Make buildings clickable
+      newBuilding = { mesh: clinic, entranceZone: new Vector3(x + 0.8, 0, z), type: "clinic", workers: [], capacity: 999 };
       clinicsRef.current.push(newBuilding);
     } else if (type === "restaurant") {
       const index = restaurantsRef.current.length;
@@ -413,8 +480,8 @@ export function Canvas() {
       const restaurant = MeshBuilder.CreateBox(`restaurant-${index}`, { width: 0.9, height: 0.6, depth: 0.75 }, scene);
       restaurant.position = new Vector3(x, 0.3, z);
       restaurant.material = restaurantMat;
-      restaurant.isPickable = false;
-      newBuilding = { mesh: restaurant, entranceZone: new Vector3(x + 0.8, 0, z), type: "restaurant" };
+      restaurant.isPickable = true; // Make buildings clickable
+      newBuilding = { mesh: restaurant, entranceZone: new Vector3(x + 0.8, 0, z), type: "restaurant", workers: [], capacity: 999 };
       restaurantsRef.current.push(newBuilding);
     } else {
       const index = bathhousesRef.current.length;
@@ -423,8 +490,8 @@ export function Canvas() {
       const bathhouse = MeshBuilder.CreateCylinder(`bathhouse-${index}`, { height: 0.5, diameter: 0.8 }, scene);
       bathhouse.position = new Vector3(x, 0.25, z);
       bathhouse.material = bathhouseMat;
-      bathhouse.isPickable = false;
-      newBuilding = { mesh: bathhouse, entranceZone: new Vector3(x + 0.8, 0, z), type: "bathhouse" };
+      bathhouse.isPickable = true; // Make buildings clickable
+      newBuilding = { mesh: bathhouse, entranceZone: new Vector3(x + 0.8, 0, z), type: "bathhouse", workers: [], capacity: 999 };
       bathhousesRef.current.push(newBuilding);
     }
 
@@ -528,21 +595,63 @@ export function Canvas() {
     // Find the actual worker in the ref and update it
     const workerInRef = workersRef.current.find(w => w.agentIndex === worker.agentIndex);
     if (workerInRef) {
-      workerInRef.workplace = workplace;
+      // Remove from old workplace
+      if (workerInRef.workplace) {
+        const oldWorkplaceIndex = workerInRef.workplace.workers.indexOf(worker.agentIndex);
+        if (oldWorkplaceIndex !== -1) {
+          workerInRef.workplace.workers.splice(oldWorkplaceIndex, 1);
+        }
+      }
+
+      // Add to new workplace (if not null)
+      if (workplace) {
+        if (workplace.workers.length < workplace.capacity) {
+          workplace.workers.push(worker.agentIndex);
+          workerInRef.workplace = workplace;
+          console.log(`Worker ${worker.agentIndex} workplace changed to Workplace ${workplacesRef.current.indexOf(workplace)}`);
+        } else {
+          console.log(`Workplace ${workplacesRef.current.indexOf(workplace)} is full! Capacity: ${workplace.capacity}`);
+          return; // Don't change if workplace is full
+        }
+      } else {
+        workerInRef.workplace = null;
+        console.log(`Worker ${worker.agentIndex} is now unemployed`);
+      }
+
       // Update the selected worker state to reflect the change
       setSelectedWorker({ ...workerInRef });
-      console.log(`Worker ${worker.agentIndex} workplace changed to ${workplace ? 'Workplace ' + workplacesRef.current.indexOf(workplace) : 'None'}`);
     }
   };
 
-  const changeWorkerHouse = (worker: Worker, house: Building) => {
+  const changeWorkerHouse = (worker: Worker, house: Building | null) => {
     // Find the actual worker in the ref and update it
     const workerInRef = workersRef.current.find(w => w.agentIndex === worker.agentIndex);
     if (workerInRef) {
-      workerInRef.house = house;
+      // Remove from old house
+      if (workerInRef.house) {
+        const oldHouseIndex = workerInRef.house.workers.indexOf(worker.agentIndex);
+        if (oldHouseIndex !== -1) {
+          workerInRef.house.workers.splice(oldHouseIndex, 1);
+        }
+      }
+
+      // Add to new house (if not null)
+      if (house) {
+        if (house.workers.length < house.capacity) {
+          house.workers.push(worker.agentIndex);
+          workerInRef.house = house;
+          console.log(`Worker ${worker.agentIndex} house changed to House ${housesRef.current.indexOf(house)}`);
+        } else {
+          console.log(`House ${housesRef.current.indexOf(house)} is full! Capacity: ${house.capacity}`);
+          return; // Don't change if house is full
+        }
+      } else {
+        workerInRef.house = null;
+        console.log(`Worker ${worker.agentIndex} is now homeless`);
+      }
+
       // Update the selected worker state to reflect the change
       setSelectedWorker({ ...workerInRef });
-      console.log(`Worker ${worker.agentIndex} house changed to House ${housesRef.current.indexOf(house)}`);
     }
   };
 
@@ -597,6 +706,129 @@ export function Canvas() {
           👷 Worker
         </button>
       </div>
+
+      {/* Building Info Panel */}
+      {showBuildingPanel && selectedBuilding && (
+        <div style={{
+          position: "absolute",
+          top: 10,
+          left: 10,
+          background: "rgba(0, 0, 0, 0.9)",
+          color: "white",
+          padding: "20px",
+          borderRadius: "8px",
+          minWidth: "300px",
+          maxWidth: "400px",
+          maxHeight: "80vh",
+          overflowY: "auto",
+          boxShadow: "0 4px 6px rgba(0, 0, 0, 0.3)",
+          zIndex: 1000,
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "15px" }}>
+            <h2 style={{ margin: 0, fontSize: "20px" }}>
+              {selectedBuilding.type === "house" && "🏠 House"}
+              {selectedBuilding.type === "workplace" && "🏢 Workplace"}
+              {selectedBuilding.type === "tavern" && "🍺 Tavern"}
+              {selectedBuilding.type === "clinic" && "🏥 Clinic"}
+              {selectedBuilding.type === "restaurant" && "🍽️ Restaurant"}
+              {selectedBuilding.type === "bathhouse" && "🛁 Bathhouse"}
+              {" "}
+              {selectedBuilding.type === "house" && housesRef.current.indexOf(selectedBuilding)}
+              {selectedBuilding.type === "workplace" && workplacesRef.current.indexOf(selectedBuilding)}
+              {selectedBuilding.type === "tavern" && tavernsRef.current.indexOf(selectedBuilding)}
+              {selectedBuilding.type === "clinic" && clinicsRef.current.indexOf(selectedBuilding)}
+              {selectedBuilding.type === "restaurant" && restaurantsRef.current.indexOf(selectedBuilding)}
+              {selectedBuilding.type === "bathhouse" && bathhousesRef.current.indexOf(selectedBuilding)}
+            </h2>
+            <button
+              onClick={() => setShowBuildingPanel(false)}
+              style={{
+                background: "#f44336",
+                color: "white",
+                border: "none",
+                borderRadius: "4px",
+                padding: "5px 10px",
+                cursor: "pointer",
+                fontSize: "14px",
+              }}
+            >
+              ✕
+            </button>
+          </div>
+
+          <hr style={{ margin: "15px 0", border: "1px solid #555" }} />
+
+          <div style={{ marginBottom: "15px" }}>
+            <strong>📊 Occupancy:</strong>
+            <div style={{ fontSize: "24px", marginTop: "5px" }}>
+              {selectedBuilding.workers.length} / {selectedBuilding.capacity}
+            </div>
+            <div style={{
+              width: "100%",
+              height: "10px",
+              background: "#333",
+              borderRadius: "5px",
+              marginTop: "8px",
+              overflow: "hidden"
+            }}>
+              <div style={{
+                width: `${(selectedBuilding.workers.length / selectedBuilding.capacity) * 100}%`,
+                height: "100%",
+                background: selectedBuilding.workers.length >= selectedBuilding.capacity ? "#f44336" : "#4caf50",
+                transition: "width 0.3s"
+              }}></div>
+            </div>
+          </div>
+
+          <hr style={{ margin: "15px 0", border: "1px solid #555" }} />
+
+          <h3 style={{ margin: "10px 0", fontSize: "16px" }}>👷 Assigned Workers</h3>
+          {selectedBuilding.workers.length === 0 ? (
+            <div style={{ color: "#999", fontStyle: "italic", padding: "10px 0" }}>
+              No workers assigned
+            </div>
+          ) : (
+            <div style={{ maxHeight: "300px", overflowY: "auto" }}>
+              {selectedBuilding.workers.map((agentIndex) => {
+                const worker = workersRef.current.find(w => w.agentIndex === agentIndex);
+                if (!worker) return null;
+
+                return (
+                  <div
+                    key={agentIndex}
+                    onClick={() => {
+                      setSelectedWorker(worker);
+                      setShowWorkerPanel(true);
+                      setShowBuildingPanel(false);
+                    }}
+                    style={{
+                      padding: "10px",
+                      marginBottom: "8px",
+                      background: "rgba(255, 255, 255, 0.1)",
+                      borderRadius: "4px",
+                      cursor: "pointer",
+                      transition: "background 0.2s",
+                    }}
+                    onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.2)"}
+                    onMouseLeave={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.1)"}
+                  >
+                    <div style={{ fontWeight: "bold", marginBottom: "5px" }}>
+                      Worker {agentIndex}
+                    </div>
+                    <div style={{ fontSize: "12px", color: "#ccc" }}>
+                      ❤️ {worker.health.toFixed(0)} | 😊 {worker.happiness.toFixed(0)} |
+                      🍽️ {worker.hunger.toFixed(0)} | ⚡ {worker.energy.toFixed(0)}
+                    </div>
+                    <div style={{ fontSize: "12px", color: "#999", marginTop: "3px" }}>
+                      State: {worker.state}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Worker Info Panel */}
       {showWorkerPanel && selectedWorker && (
@@ -772,10 +1004,10 @@ export function Canvas() {
 
           <h3 style={{ margin: "10px 0", fontSize: "16px" }}>🏠 Change House</h3>
           <select
-            value={housesRef.current.indexOf(selectedWorker.house)}
+            value={selectedWorker.house ? housesRef.current.indexOf(selectedWorker.house) : -1}
             onChange={(e) => {
               const index = parseInt(e.target.value);
-              const house = housesRef.current[index];
+              const house = index >= 0 ? housesRef.current[index] : null;
               changeWorkerHouse(selectedWorker, house);
             }}
             style={{
@@ -790,8 +1022,11 @@ export function Canvas() {
               marginBottom: "15px",
             }}
           >
-            {housesRef.current.map((_, index) => (
-              <option key={index} value={index}>House {index}</option>
+            <option value={-1}>Homeless</option>
+            {housesRef.current.map((house, index) => (
+              <option key={index} value={index}>
+                House {index} ({house.workers.length}/{house.capacity})
+              </option>
             ))}
           </select>
 
@@ -815,8 +1050,10 @@ export function Canvas() {
             }}
           >
             <option value={-1}>No Workplace</option>
-            {workplacesRef.current.map((_, index) => (
-              <option key={index} value={index}>Workplace {index}</option>
+            {workplacesRef.current.map((workplace, index) => (
+              <option key={index} value={index}>
+                Workplace {index} ({workplace.workers.length}/{workplace.capacity})
+              </option>
             ))}
           </select>
 
@@ -902,11 +1139,13 @@ interface Building {
   mesh: Mesh;
   entranceZone: Vector3;
   type: "house" | "workplace" | "tavern" | "clinic" | "restaurant" | "bathhouse";
+  workers: number[]; // Array of worker agent indices assigned to this building
+  capacity: number; // Maximum workers allowed
 }
 
 interface Worker {
   agentIndex: number;
-  house: Building;
+  house: Building | null; // Can be null if homeless
   workplace: Building | null;
   happiness: number;
   health: number;
@@ -952,11 +1191,11 @@ function createHouses(scene: Scene, count: number): Building[] {
     const house = MeshBuilder.CreateBox(`house-${i}`, { width: 0.75, height: 0.5, depth: 0.75 }, scene);
     house.position = new Vector3(x, 0.25, z);
     house.material = houseMat;
-    house.isPickable = false;
+    house.isPickable = true; // Make buildings clickable
 
     const entranceZone = new Vector3(x + 0.8, 0, z);
 
-    houses.push({ mesh: house, entranceZone, type: "house" });
+    houses.push({ mesh: house, entranceZone, type: "house", workers: [], capacity: 4 });
   }
 
   return houses;
@@ -986,11 +1225,11 @@ function createWorkplaces(scene: Scene, count: number): Building[] {
     const workplace = MeshBuilder.CreateCylinder(`workplace-${i}`, { height: 0.75, diameter: 0.75 }, scene);
     workplace.position = new Vector3(x, 0.375, z);
     workplace.material = workMat;
-    workplace.isPickable = false;
+    workplace.isPickable = true; // Make buildings clickable
 
     const entranceZone = new Vector3(x + 0.8, 0, z);
 
-    workplaces.push({ mesh: workplace, entranceZone, type: "workplace" });
+    workplaces.push({ mesh: workplace, entranceZone, type: "workplace", workers: [], capacity: 5 });
   }
 
   return workplaces;
@@ -1024,11 +1263,11 @@ function createTaverns(scene: Scene, count: number): Building[] {
     }, scene);
     tavern.position = new Vector3(x, 0.3, z);
     tavern.material = tavernMat;
-    tavern.isPickable = false;
+    tavern.isPickable = true; // Make buildings clickable
 
     const entranceZone = new Vector3(x + 0.8, 0, z);
 
-    taverns.push({ mesh: tavern, entranceZone, type: "tavern" });
+    taverns.push({ mesh: tavern, entranceZone, type: "tavern", workers: [], capacity: 999 });
   }
 
   return taverns;
@@ -1059,11 +1298,11 @@ function createClinics(scene: Scene, count: number): Building[] {
     const clinic = MeshBuilder.CreateBox(`clinic-${i}`, { width: 0.75, height: 0.5, depth: 0.75 }, scene);
     clinic.position = new Vector3(x, 0.25, z);
     clinic.material = clinicMat;
-    clinic.isPickable = false;
+    clinic.isPickable = true; // Make buildings clickable
 
     const entranceZone = new Vector3(x + 0.8, 0, z);
 
-    clinics.push({ mesh: clinic, entranceZone, type: "clinic" });
+    clinics.push({ mesh: clinic, entranceZone, type: "clinic", workers: [], capacity: 999 });
   }
 
   return clinics;
@@ -1094,11 +1333,11 @@ function createRestaurants(scene: Scene, count: number): Building[] {
     const restaurant = MeshBuilder.CreateBox(`restaurant-${i}`, { width: 0.9, height: 0.6, depth: 0.75 }, scene);
     restaurant.position = new Vector3(x, 0.3, z);
     restaurant.material = restaurantMat;
-    restaurant.isPickable = false;
+    restaurant.isPickable = true; // Make buildings clickable
 
     const entranceZone = new Vector3(x + 0.8, 0, z);
 
-    restaurants.push({ mesh: restaurant, entranceZone, type: "restaurant" });
+    restaurants.push({ mesh: restaurant, entranceZone, type: "restaurant", workers: [], capacity: 999 });
   }
 
   return restaurants;
@@ -1129,11 +1368,11 @@ function createBathhouses(scene: Scene, count: number): Building[] {
     const bathhouse = MeshBuilder.CreateCylinder(`bathhouse-${i}`, { height: 0.5, diameter: 0.8 }, scene);
     bathhouse.position = new Vector3(x, 0.25, z);
     bathhouse.material = bathhouseMat;
-    bathhouse.isPickable = false;
+    bathhouse.isPickable = true; // Make buildings clickable
 
     const entranceZone = new Vector3(x + 0.8, 0, z);
 
-    bathhouses.push({ mesh: bathhouse, entranceZone, type: "bathhouse" });
+    bathhouses.push({ mesh: bathhouse, entranceZone, type: "bathhouse", workers: [], capacity: 999 });
   }
 
   return bathhouses;
@@ -1220,8 +1459,14 @@ function startSimulation(
 
       switch (worker.state) {
         case "sleeping": {
-          // Restore some health while sleeping
-          worker.health = Math.min(100, worker.health + 2);
+          // Homeless workers suffer health penalty while sleeping outside
+          if (!worker.house) {
+            worker.health = Math.max(0, worker.health - 1); // Health penalty for homelessness
+            worker.happiness = Math.max(0, worker.happiness - 0.5); // Unhappy being homeless
+          } else {
+            // Restore some health while sleeping in a house
+            worker.health = Math.min(100, worker.health + 2);
+          }
 
           // Small random chance of getting ill while sleeping - 0.5% chance per tick
           if (Math.random() < 0.005) {
@@ -1302,9 +1547,16 @@ function startSimulation(
             // 3. Energy critical - go home to sleep
             else if (worker.energy < 25) {
               worker.state = "going_home";
-              const target = navigationPlugin.getClosestPoint(worker.house.entranceZone);
-              crowd.agentGoto(worker.agentIndex, target);
-              console.log(`Agent ${worker.agentIndex} going home (exhausted, energy: ${worker.energy.toFixed(0)})`);
+              if (worker.house) {
+                const target = navigationPlugin.getClosestPoint(worker.house.entranceZone);
+                crowd.agentGoto(worker.agentIndex, target);
+                console.log(`Agent ${worker.agentIndex} going home (exhausted, energy: ${worker.energy.toFixed(0)})`);
+              } else {
+                // Homeless - just sleep where they are
+                worker.state = "sleeping";
+                worker.stateTimer = 0;
+                console.log(`Agent ${worker.agentIndex} is homeless, sleeping outside (exhausted)`);
+              }
             }
             // 4. Hygiene low - go to bathhouse
             else if (worker.hygiene < 30 && bathhouses.length > 0) {
@@ -1324,10 +1576,17 @@ function startSimulation(
             }
             // 6. All needs satisfied - go home
             else {
-              worker.state = "going_home";
-              const target = navigationPlugin.getClosestPoint(worker.house.entranceZone);
-              crowd.agentGoto(worker.agentIndex, target);
-              console.log(`Agent ${worker.agentIndex} going home`);
+              if (worker.house) {
+                worker.state = "going_home";
+                const target = navigationPlugin.getClosestPoint(worker.house.entranceZone);
+                crowd.agentGoto(worker.agentIndex, target);
+                console.log(`Agent ${worker.agentIndex} going home`);
+              } else {
+                // Homeless - just sleep where they are
+                worker.state = "sleeping";
+                worker.stateTimer = 0;
+                console.log(`Agent ${worker.agentIndex} is homeless, sleeping outside`);
+              }
             }
             worker.stateTimer = 0;
           }
@@ -1351,10 +1610,16 @@ function startSimulation(
         case "at_tavern": {
           worker.happiness = Math.min(100, worker.happiness + 10);
           if (worker.stateTimer > 5) {
-            worker.state = "going_home";
-            const target = navigationPlugin.getClosestPoint(worker.house.entranceZone);
-            crowd.agentGoto(worker.agentIndex, target);
-            console.log(`Agent ${worker.agentIndex} leaving tavern, happiness: ${worker.happiness}`);
+            if (worker.house) {
+              worker.state = "going_home";
+              const target = navigationPlugin.getClosestPoint(worker.house.entranceZone);
+              crowd.agentGoto(worker.agentIndex, target);
+              console.log(`Agent ${worker.agentIndex} leaving tavern, happiness: ${worker.happiness}`);
+            } else {
+              // Homeless - just sleep where they are
+              worker.state = "sleeping";
+              console.log(`Agent ${worker.agentIndex} leaving tavern (homeless), sleeping outside`);
+            }
             worker.stateTimer = 0;
           }
           break;
@@ -1378,10 +1643,16 @@ function startSimulation(
           // Restore health at clinic
           worker.health = Math.min(100, worker.health + 15);
           if (worker.stateTimer > 3) {
-            worker.state = "going_home";
-            const target = navigationPlugin.getClosestPoint(worker.house.entranceZone);
-            crowd.agentGoto(worker.agentIndex, target);
-            console.log(`Agent ${worker.agentIndex} leaving clinic, health: ${worker.health}`);
+            if (worker.house) {
+              worker.state = "going_home";
+              const target = navigationPlugin.getClosestPoint(worker.house.entranceZone);
+              crowd.agentGoto(worker.agentIndex, target);
+              console.log(`Agent ${worker.agentIndex} leaving clinic, health: ${worker.health}`);
+            } else {
+              // Homeless - just sleep where they are
+              worker.state = "sleeping";
+              console.log(`Agent ${worker.agentIndex} leaving clinic (homeless), sleeping outside`);
+            }
             worker.stateTimer = 0;
           }
           break;
@@ -1419,11 +1690,15 @@ function startSimulation(
               const target = navigationPlugin.getClosestPoint(tavern.entranceZone);
               crowd.agentGoto(worker.agentIndex, target);
               console.log(`Agent ${worker.agentIndex} going to tavern after eating`);
-            } else {
+            } else if (worker.house) {
               worker.state = "going_home";
               const target = navigationPlugin.getClosestPoint(worker.house.entranceZone);
               crowd.agentGoto(worker.agentIndex, target);
               console.log(`Agent ${worker.agentIndex} going home after eating, hunger: ${worker.hunger.toFixed(0)}`);
+            } else {
+              // Homeless - just sleep where they are
+              worker.state = "sleeping";
+              console.log(`Agent ${worker.agentIndex} done eating (homeless), sleeping outside`);
             }
             worker.stateTimer = 0;
           }
@@ -1462,11 +1737,15 @@ function startSimulation(
               const target = navigationPlugin.getClosestPoint(tavern.entranceZone);
               crowd.agentGoto(worker.agentIndex, target);
               console.log(`Agent ${worker.agentIndex} going to tavern after bathing`);
-            } else {
+            } else if (worker.house) {
               worker.state = "going_home";
               const target = navigationPlugin.getClosestPoint(worker.house.entranceZone);
               crowd.agentGoto(worker.agentIndex, target);
               console.log(`Agent ${worker.agentIndex} going home after bathing, hygiene: ${worker.hygiene.toFixed(0)}`);
+            } else {
+              // Homeless - just sleep where they are
+              worker.state = "sleeping";
+              console.log(`Agent ${worker.agentIndex} done bathing (homeless), sleeping outside`);
             }
             worker.stateTimer = 0;
           }
@@ -1474,11 +1753,18 @@ function startSimulation(
         }
 
         case "going_home": {
-          const homePos = crowd.getAgentPosition(worker.agentIndex);
-          if (Vector3.Distance(homePos, worker.house.entranceZone) < 0.5) {
+          // Only process if worker has a house
+          if (worker.house) {
+            const homePos = crowd.getAgentPosition(worker.agentIndex);
+            if (Vector3.Distance(homePos, worker.house.entranceZone) < 0.5) {
+              worker.state = "sleeping";
+              worker.stateTimer = 0;
+              console.log(`Agent ${worker.agentIndex} arrived home`);
+            }
+          } else {
+            // Homeless worker shouldn't be in this state, transition to sleeping
             worker.state = "sleeping";
             worker.stateTimer = 0;
-            console.log(`Agent ${worker.agentIndex} arrived home`);
           }
           break;
         }
