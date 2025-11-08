@@ -14,6 +14,7 @@ import {
   CreateGround,
   type IAgentParameters,
   PointerEventTypes,
+  HighlightLayer,
 } from "@babylonjs/core";
 import "@babylonjs/loaders";
 import { CreateNavigationPluginAsync, WaitForFullTileCacheUpdate } from "@babylonjs/addons";
@@ -35,6 +36,7 @@ export function Canvas() {
   const workersRef = useRef<Worker[]>([]);
   const tileCacheRef = useRef<any>(null);
   const agentMeshesRef = useRef<Map<number, Mesh>>(new Map());
+  const highlightLayerRef = useRef<HighlightLayer | null>(null);
 
   // UI State
   const [selectedWorker, setSelectedWorker] = useState<Worker | null>(null);
@@ -42,6 +44,23 @@ export function Canvas() {
   const [selectedBuilding, setSelectedBuilding] = useState<Building | null>(null);
   const [showBuildingPanel, setShowBuildingPanel] = useState(false);
   const [workersToAssign, setWorkersToAssign] = useState(1); // Slider value for assigning workers
+  const [showStatsPanel, setShowStatsPanel] = useState(true); // Stats panel visibility
+  const [notification, setNotification] = useState<string | null>(null); // Notification message
+
+  // Refs to access current state in event handlers (to avoid closure issues)
+  const selectedWorkerRef = useRef<Worker | null>(null);
+  const selectedBuildingRef = useRef<Building | null>(null);
+  const changeWorkerWorkplaceRef = useRef<((worker: Worker, workplace: Building | null) => void) | null>(null);
+  const changeWorkerHouseRef = useRef<((worker: Worker, house: Building | null) => void) | null>(null);
+
+  // Sync state with refs for event handlers
+  useEffect(() => {
+    selectedWorkerRef.current = selectedWorker;
+  }, [selectedWorker]);
+
+  useEffect(() => {
+    selectedBuildingRef.current = selectedBuilding;
+  }, [selectedBuilding]);
 
   // Update worker panel in real-time
   useEffect(() => {
@@ -70,6 +89,28 @@ export function Canvas() {
     }
   }, [showBuildingPanel, selectedBuilding]);
 
+  // Manage selection outline highlighting
+  useEffect(() => {
+    const highlightLayer = highlightLayerRef.current;
+    if (!highlightLayer) return;
+
+    // Clear all highlights
+    highlightLayer.removeAllMeshes();
+
+    // Highlight selected building
+    if (selectedBuilding && selectedBuilding.mesh) {
+      highlightLayer.addMesh(selectedBuilding.mesh, Color3.White());
+    }
+
+    // Highlight selected worker
+    if (selectedWorker) {
+      const workerMesh = agentMeshesRef.current.get(selectedWorker.agentIndex);
+      if (workerMesh) {
+        highlightLayer.addMesh(workerMesh, Color3.White());
+      }
+    }
+  }, [selectedBuilding, selectedWorker]);
+
   // Initialize scene only once
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -92,10 +133,16 @@ export function Canvas() {
     const light = new HemisphericLight("light", new Vector3(0, 1, 0), scene);
     light.intensity = 0.7;
 
+    // Create highlight layer for selection outlines
+    const highlightLayer = new HighlightLayer("highlight", scene);
+    highlightLayer.outerGlow = false; // Only show inner glow (outline)
+    highlightLayer.innerGlow = true;
+    highlightLayerRef.current = highlightLayer;
+
     //
 
 
-    
+
     //
 
   //  const testAsset = "https://assets.babylonjs.com/meshes/alien.glb";
@@ -298,13 +345,15 @@ export function Canvas() {
       workersRef.current = workers;
       console.log(`All ${AGENT_COUNT} agents created with assignments`);
 
-      // Add click handler for agents
+      // Add click handler for agents and buildings
       scene.onPointerObservable.add((pointerInfo) => {
         if (pointerInfo.type === PointerEventTypes.POINTERDOWN) {
           const pickResult = pointerInfo.pickInfo;
+          const isRightClick = pointerInfo.event.button === 2; // Right mouse button
+
           if (pickResult?.hit && pickResult.pickedMesh) {
             const meshName = pickResult.pickedMesh.name;
-            console.log("Clicked on mesh:", meshName, "isPickable:", pickResult.pickedMesh.isPickable);
+            console.log("Clicked on mesh:", meshName, "isPickable:", pickResult.pickedMesh.isPickable, "rightClick:", isRightClick);
 
             // Check if clicked on agent mesh (format: "agent-0", "agent-1", etc.)
             if (meshName.startsWith("agent-")) {
@@ -322,8 +371,11 @@ export function Canvas() {
                 const worker = workersRef.current.find(w => w.agentIndex === agentIndex);
                 if (worker) {
                   console.log("Found worker:", worker);
-                  setSelectedWorker(worker);
-                  setShowWorkerPanel(true);
+                  if (!isRightClick) {
+                    // Left click - select worker
+                    setSelectedWorker(worker);
+                    setShowWorkerPanel(true);
+                  }
                 } else {
                   console.log("Worker not found for agent index:", agentIndex);
                   console.log("Available workers:", workersRef.current.map(w => w.agentIndex));
@@ -351,15 +403,80 @@ export function Canvas() {
                 else if (buildingType === "bathhouse") building = bathhousesRef.current[buildingIndex];
 
                 if (building) {
-                  console.log("Clicked on building:", buildingType, buildingIndex);
-                  setSelectedBuilding(building);
-                  setShowBuildingPanel(true);
-                  setShowWorkerPanel(false); // Close worker panel
+                  console.log("Clicked on building:", buildingType, buildingIndex, "rightClick:", isRightClick);
+
+                  if (isRightClick) {
+                    // Right click - assign selected worker to this building
+                    const currentSelectedWorker = selectedWorkerRef.current;
+                    if (currentSelectedWorker) {
+                      const crowd = crowdRef.current;
+                      const navigationPlugin = navigationPluginRef.current;
+                      const changeHouse = changeWorkerHouseRef.current;
+                      const changeWorkplace = changeWorkerWorkplaceRef.current;
+
+                      if (crowd && navigationPlugin && changeHouse && changeWorkplace) {
+                        // Assign worker to building based on type
+                        if (buildingType === "house") {
+                          // Assign to house
+                          if (building.workers.length < building.capacity) {
+                            changeHouse(currentSelectedWorker, building);
+                            const targetPos = building.entranceZone;
+                            crowd.agentGoto(currentSelectedWorker.agentIndex, navigationPlugin.getClosestPoint(targetPos));
+                            setNotification(`Worker ${currentSelectedWorker.agentIndex} assigned to House ${buildingIndex}`);
+                            setTimeout(() => setNotification(null), 2000);
+                          } else {
+                            setNotification(`⚠️ House ${buildingIndex} is full!`);
+                            setTimeout(() => setNotification(null), 2000);
+                          }
+                        } else {
+                          // Assign to workplace (workplace, clinic, restaurant, bathhouse, tavern)
+                          if (building.workers.length < building.capacity) {
+                            changeWorkplace(currentSelectedWorker, building);
+                            const targetPos = building.entranceZone;
+                            crowd.agentGoto(currentSelectedWorker.agentIndex, navigationPlugin.getClosestPoint(targetPos));
+                            const buildingName = `${buildingType.charAt(0).toUpperCase() + buildingType.slice(1)} ${buildingIndex}`;
+                            setNotification(`Worker ${currentSelectedWorker.agentIndex} assigned to ${buildingName}`);
+                            setTimeout(() => setNotification(null), 2000);
+                          } else {
+                            const buildingName = `${buildingType.charAt(0).toUpperCase() + buildingType.slice(1)} ${buildingIndex}`;
+                            setNotification(`⚠️ ${buildingName} is full!`);
+                            setTimeout(() => setNotification(null), 2000);
+                          }
+                        }
+                      }
+                    } else {
+                      console.log("No worker selected - cannot assign to building");
+                      setNotification("⚠️ Select a worker first!");
+                      setTimeout(() => setNotification(null), 2000);
+                    }
+                  } else {
+                    // Left click - select building
+                    setSelectedBuilding(building);
+                    setShowBuildingPanel(true);
+                  }
                 }
               }
             }
+            // Clicked on ground or other non-interactive mesh
+            else if (meshName === "ground" || !meshName.startsWith("agent-")) {
+              if (!isRightClick) {
+                // Left click on ground - clear selections
+                console.log("Clicked on ground/empty space - clearing selections");
+                setSelectedWorker(null);
+                setSelectedBuilding(null);
+                setShowWorkerPanel(false);
+                setShowBuildingPanel(false);
+              }
+            }
           } else {
-            console.log("No mesh picked or no hit");
+            // No mesh picked - clear selections on left click
+            if (!isRightClick) {
+              console.log("No mesh picked - clearing selections");
+              setSelectedWorker(null);
+              setSelectedBuilding(null);
+              setShowWorkerPanel(false);
+              setShowBuildingPanel(false);
+            }
           }
         }
       });
@@ -658,6 +775,8 @@ export function Canvas() {
       }
     }
   };
+  // Store function in ref for event handlers
+  changeWorkerWorkplaceRef.current = changeWorkerWorkplace;
 
   const changeWorkerHouse = (worker: Worker, house: Building | null) => {
     // Find the actual worker in the ref and update it
@@ -695,12 +814,15 @@ export function Canvas() {
       }
     }
   };
+  // Store function in ref for event handlers
+  changeWorkerHouseRef.current = changeWorkerHouse;
 
   return (
     <>
       <canvas
         ref={canvasRef}
         id="renderCanvas"
+        onContextMenu={(e) => e.preventDefault()} // Prevent right-click context menu
         style={{
           display: "block",
           width: "100%",
@@ -753,7 +875,7 @@ export function Canvas() {
         <div style={{
           position: "absolute",
           top: 10,
-          left: 10,
+          left: 220,
           background: "rgba(0, 0, 0, 0.9)",
           color: "white",
           padding: "20px",
@@ -1354,6 +1476,298 @@ export function Canvas() {
           </div>
         </div>
       )}
+
+      {/* Stats Panel */}
+      {showStatsPanel && (
+        <div style={{
+          position: "absolute",
+          bottom: 10,
+          left: 10,
+          background: "rgba(0, 0, 0, 0.9)",
+          color: "white",
+          padding: "15px",
+          borderRadius: "8px",
+          minWidth: "350px",
+          maxWidth: "450px",
+          maxHeight: "40vh",
+          overflowY: "auto",
+          boxShadow: "0 4px 6px rgba(0, 0, 0, 0.3)",
+          zIndex: 1000,
+          fontSize: "13px",
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+            <h2 style={{ margin: 0, fontSize: "18px" }}>📊 Statistics</h2>
+            <button
+              onClick={() => setShowStatsPanel(false)}
+              style={{
+                background: "transparent",
+                color: "white",
+                border: "none",
+                fontSize: "20px",
+                cursor: "pointer",
+                padding: "0 5px",
+              }}
+            >
+              ✕
+            </button>
+          </div>
+
+          <hr style={{ margin: "10px 0", border: "1px solid #555" }} />
+
+          {/* Summary Stats */}
+          <div style={{ marginBottom: "15px" }}>
+            <h3 style={{ margin: "0 0 8px 0", fontSize: "15px" }}>📈 Summary</h3>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", fontSize: "12px" }}>
+              <div>👷 Workers: <strong>{workersRef.current.length}</strong></div>
+              <div>🏠 Houses: <strong>{housesRef.current.length}</strong></div>
+              <div>🏢 Workplaces: <strong>{workplacesRef.current.length}</strong></div>
+              <div>🍺 Taverns: <strong>{tavernsRef.current.length}</strong></div>
+              <div>🏥 Clinics: <strong>{clinicsRef.current.length}</strong></div>
+              <div>🍽️ Restaurants: <strong>{restaurantsRef.current.length}</strong></div>
+              <div>🛁 Bathhouses: <strong>{bathhousesRef.current.length}</strong></div>
+              <div>😴 Homeless: <strong style={{ color: "#ff9800" }}>{workersRef.current.filter(w => !w.house).length}</strong></div>
+              <div>💼 Unemployed: <strong style={{ color: "#ff9800" }}>{workersRef.current.filter(w => !w.workplace).length}</strong></div>
+            </div>
+          </div>
+
+          <hr style={{ margin: "10px 0", border: "1px solid #555" }} />
+
+          {/* Buildings List */}
+          <div style={{ marginBottom: "15px" }}>
+            <h3 style={{ margin: "0 0 8px 0", fontSize: "15px" }}>🏗️ Buildings</h3>
+            <div style={{ maxHeight: "150px", overflowY: "auto" }}>
+              {/* Houses */}
+              {housesRef.current.map((house, index) => (
+                <div
+                  key={`stats-house-${index}`}
+                  onClick={() => {
+                    setSelectedBuilding(house);
+                    setShowBuildingPanel(true);
+                  }}
+                  style={{
+                    padding: "6px 8px",
+                    marginBottom: "4px",
+                    background: selectedBuilding === house ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    transition: "background 0.2s",
+                    fontSize: "12px",
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
+                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === house ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
+                >
+                  🏠 House {index} - {house.workers.length}/{house.capacity}
+                </div>
+              ))}
+              {/* Workplaces */}
+              {workplacesRef.current.map((workplace, index) => (
+                <div
+                  key={`stats-workplace-${index}`}
+                  onClick={() => {
+                    setSelectedBuilding(workplace);
+                    setShowBuildingPanel(true);
+                  }}
+                  style={{
+                    padding: "6px 8px",
+                    marginBottom: "4px",
+                    background: selectedBuilding === workplace ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    transition: "background 0.2s",
+                    fontSize: "12px",
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
+                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === workplace ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
+                >
+                  🏢 Workplace {index} - {workplace.workers.length}/{workplace.capacity}
+                </div>
+              ))}
+              {/* Taverns */}
+              {tavernsRef.current.map((tavern, index) => (
+                <div
+                  key={`stats-tavern-${index}`}
+                  onClick={() => {
+                    setSelectedBuilding(tavern);
+                    setShowBuildingPanel(true);
+                  }}
+                  style={{
+                    padding: "6px 8px",
+                    marginBottom: "4px",
+                    background: selectedBuilding === tavern ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    transition: "background 0.2s",
+                    fontSize: "12px",
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
+                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === tavern ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
+                >
+                  🍺 Tavern {index} - Staff: {tavern.workers.length}/{tavern.capacity}
+                </div>
+              ))}
+              {/* Clinics */}
+              {clinicsRef.current.map((clinic, index) => (
+                <div
+                  key={`stats-clinic-${index}`}
+                  onClick={() => {
+                    setSelectedBuilding(clinic);
+                    setShowBuildingPanel(true);
+                  }}
+                  style={{
+                    padding: "6px 8px",
+                    marginBottom: "4px",
+                    background: selectedBuilding === clinic ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    transition: "background 0.2s",
+                    fontSize: "12px",
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
+                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === clinic ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
+                >
+                  🏥 Clinic {index} - Staff: {clinic.workers.length}/{clinic.capacity}
+                </div>
+              ))}
+              {/* Restaurants */}
+              {restaurantsRef.current.map((restaurant, index) => (
+                <div
+                  key={`stats-restaurant-${index}`}
+                  onClick={() => {
+                    setSelectedBuilding(restaurant);
+                    setShowBuildingPanel(true);
+                  }}
+                  style={{
+                    padding: "6px 8px",
+                    marginBottom: "4px",
+                    background: selectedBuilding === restaurant ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    transition: "background 0.2s",
+                    fontSize: "12px",
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
+                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === restaurant ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
+                >
+                  🍽️ Restaurant {index} - Staff: {restaurant.workers.length}/{restaurant.capacity}
+                </div>
+              ))}
+              {/* Bathhouses */}
+              {bathhousesRef.current.map((bathhouse, index) => (
+                <div
+                  key={`stats-bathhouse-${index}`}
+                  onClick={() => {
+                    setSelectedBuilding(bathhouse);
+                    setShowBuildingPanel(true);
+                  }}
+                  style={{
+                    padding: "6px 8px",
+                    marginBottom: "4px",
+                    background: selectedBuilding === bathhouse ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    transition: "background 0.2s",
+                    fontSize: "12px",
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
+                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === bathhouse ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
+                >
+                  🛁 Bathhouse {index} - Staff: {bathhouse.workers.length}/{bathhouse.capacity}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <hr style={{ margin: "10px 0", border: "1px solid #555" }} />
+
+          {/* Workers List */}
+          <div>
+            <h3 style={{ margin: "0 0 8px 0", fontSize: "15px" }}>👷 Workers</h3>
+            <div style={{ maxHeight: "150px", overflowY: "auto" }}>
+              {workersRef.current.map((worker) => (
+                <div
+                  key={`stats-worker-${worker.agentIndex}`}
+                  onClick={() => {
+                    setSelectedWorker(worker);
+                    setShowWorkerPanel(true);
+                  }}
+                  style={{
+                    padding: "6px 8px",
+                    marginBottom: "4px",
+                    background: selectedWorker?.agentIndex === worker.agentIndex ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
+                    borderRadius: "4px",
+                    cursor: "pointer",
+                    transition: "background 0.2s",
+                    fontSize: "11px",
+                  }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
+                  onMouseLeave={(e) => e.currentTarget.style.background = selectedWorker?.agentIndex === worker.agentIndex ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
+                >
+                  <div style={{ fontWeight: "bold", marginBottom: "2px" }}>
+                    Worker {worker.agentIndex} - {worker.state}
+                  </div>
+                  <div style={{ color: "#ccc" }}>
+                    ❤️ {worker.health.toFixed(0)} | 😊 {worker.happiness.toFixed(0)} |
+                    🍽️ {worker.hunger.toFixed(0)} | ⚡ {worker.energy.toFixed(0)}
+                  </div>
+                  <div style={{ color: "#999", fontSize: "10px", marginTop: "2px" }}>
+                    {worker.house ? `🏠 House ${housesRef.current.indexOf(worker.house)}` : "😴 Homeless"} |
+                    {worker.workplace ? ` 💼 ${worker.workplace.type} ${
+                      worker.workplace.type === "workplace" ? workplacesRef.current.indexOf(worker.workplace) :
+                      worker.workplace.type === "clinic" ? clinicsRef.current.indexOf(worker.workplace) :
+                      worker.workplace.type === "restaurant" ? restaurantsRef.current.indexOf(worker.workplace) :
+                      worker.workplace.type === "bathhouse" ? bathhousesRef.current.indexOf(worker.workplace) :
+                      worker.workplace.type === "tavern" ? tavernsRef.current.indexOf(worker.workplace) : "?"
+                    }` : " 💼 Unemployed"}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toggle Stats Panel Button */}
+      {!showStatsPanel && (
+        <button
+          onClick={() => setShowStatsPanel(true)}
+          style={{
+            position: "absolute",
+            bottom: 10,
+            left: 10,
+            background: "rgba(0, 0, 0, 0.7)",
+            color: "white",
+            border: "none",
+            borderRadius: "8px",
+            padding: "10px 15px",
+            cursor: "pointer",
+            fontSize: "14px",
+            fontWeight: "bold",
+          }}
+        >
+          📊 Show Stats
+        </button>
+      )}
+
+      {/* Notification Toast */}
+      {notification && (
+        <div style={{
+          position: "absolute",
+          top: "50%",
+          left: "50%",
+          transform: "translate(-50%, -50%)",
+          background: "rgba(0, 0, 0, 0.9)",
+          color: "white",
+          padding: "15px 25px",
+          borderRadius: "8px",
+          fontSize: "16px",
+          fontWeight: "bold",
+          boxShadow: "0 4px 12px rgba(0, 0, 0, 0.5)",
+          zIndex: 10000,
+          animation: "fadeIn 0.3s ease-in-out",
+        }}>
+          {notification}
+        </div>
+      )}
     </>
   );
 }
@@ -1377,8 +1791,8 @@ function createStaticGround(scene: Scene) {
   const mat1 = new StandardMaterial("mat1", scene);
   mat1.diffuseColor = new Color3(0.8, 1, 1);
 
-  const ground = CreateGround("ground1", { width: 20, height: 20 }, scene);
-  ground.isPickable = false; // Don't block clicks on agents
+  const ground = CreateGround("ground", { width: 20, height: 20 }, scene);
+  ground.isPickable = true; // Make pickable to detect clicks on empty space
   return ground;
 }
 
