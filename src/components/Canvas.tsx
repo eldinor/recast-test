@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import {
   Engine,
   Scene,
@@ -25,16 +25,21 @@ import type { INavMeshParametersV2 } from "@babylonjs/addons/navigation/types";
 export function Canvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sceneRef = useRef<Scene | null>(null);
-  const crowdRef = useRef<any>(null);
+  const crowdRef = useRef<unknown>(null);
   const navigationPluginRef = useRef<any>(null);
-  const housesRef = useRef<Building[]>([]);
-  const workplacesRef = useRef<Building[]>([]);
-  const tavernsRef = useRef<Building[]>([]);
-  const clinicsRef = useRef<Building[]>([]);
-  const restaurantsRef = useRef<Building[]>([]);
-  const bathhousesRef = useRef<Building[]>([]);
+
+  // Unified building storage - Map of building type to array of buildings
+  const buildingsRef = useRef<Map<BuildingType, Building[]>>(new Map([
+    ["house", []],
+    ["workplace", []],
+    ["tavern", []],
+    ["clinic", []],
+    ["restaurant", []],
+    ["bathhouse", []]
+  ]));
+
   const workersRef = useRef<Worker[]>([]);
-  const tileCacheRef = useRef<any>(null);
+  const tileCacheRef = useRef<unknown>(null);
   const agentMeshesRef = useRef<Map<number, Mesh>>(new Map());
   const highlightLayerRef = useRef<HighlightLayer | null>(null);
 
@@ -46,12 +51,63 @@ export function Canvas() {
   const [workersToAssign, setWorkersToAssign] = useState(1); // Slider value for assigning workers
   const [showStatsPanel, setShowStatsPanel] = useState(true); // Stats panel visibility
   const [notification, setNotification] = useState<string | null>(null); // Notification message
+  const [statsUpdateTrigger, setStatsUpdateTrigger] = useState(0); // Trigger to force Stats panel re-render
+  const [showAttentionPanel, setShowAttentionPanel] = useState(true); // Attention panel visibility
+  const [alertFilter, setAlertFilter] = useState<"all" | "critical" | "warning" | "info">("all"); // Alert filter
+
+  // Alert types for Attention panel
+  interface Alert {
+    id: string;
+    type: "critical" | "warning" | "info";
+    icon: string;
+    message: string;
+    timestamp: number;
+  }
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+
+  // Helper function to add alerts
+  const addAlert = useCallback((type: "critical" | "warning" | "info", icon: string, message: string) => {
+    const newAlert: Alert = {
+      id: `${Date.now()}-${Math.random()}`,
+      type,
+      icon,
+      message,
+      timestamp: Date.now(),
+    };
+    setAlerts(prev => {
+      // Keep only last 20 alerts
+      const updated = [newAlert, ...prev].slice(0, 20);
+      return updated;
+    });
+  }, []);
 
   // Refs to access current state in event handlers (to avoid closure issues)
   const selectedWorkerRef = useRef<Worker | null>(null);
   const selectedBuildingRef = useRef<Building | null>(null);
   const changeWorkerWorkplaceRef = useRef<((worker: Worker, workplace: Building | null) => void) | null>(null);
   const changeWorkerHouseRef = useRef<((worker: Worker, house: Building | null) => void) | null>(null);
+
+  // Helper functions for unified building storage
+  const getBuildings = (type: BuildingType): Building[] => {
+    return buildingsRef.current.get(type) || [];
+  };
+
+  const getAllBuildings = (): Building[] => {
+    const all: Building[] = [];
+    buildingsRef.current.forEach(buildings => all.push(...buildings));
+    return all;
+  };
+
+  const addBuildingToStorage = (type: BuildingType, building: Building): void => {
+    const buildings = buildingsRef.current.get(type) || [];
+    buildings.push(building);
+    buildingsRef.current.set(type, buildings);
+  };
+
+  const getBuildingIndex = (building: Building): number => {
+    const buildings = getBuildings(building.type);
+    return buildings.findIndex(b => b.mesh === building.mesh);
+  };
 
   // Sync state with refs for event handlers
   useEffect(() => {
@@ -198,40 +254,34 @@ export function Canvas() {
       const restaurants = createRestaurants(scene, 2);
       const bathhouses = createBathhouses(scene, 2);
 
-      housesRef.current = houses;
-      workplacesRef.current = workplaces;
-      tavernsRef.current = taverns;
-      clinicsRef.current = clinics;
-      restaurantsRef.current = restaurants;
-      bathhousesRef.current = bathhouses;
+      buildingsRef.current.set("house", houses);
+      buildingsRef.current.set("workplace", workplaces);
+      buildingsRef.current.set("tavern", taverns);
+      buildingsRef.current.set("clinic", clinics);
+      buildingsRef.current.set("restaurant", restaurants);
+      buildingsRef.current.set("bathhouse", bathhouses);
 
-      // Add obstacles to navmesh
-      const obstacles: any[] = [];
-      [...houses, ...workplaces, ...taverns, ...clinics, ...restaurants, ...bathhouses].forEach((building) => {
+      // Add obstacles to navmesh using configuration
+      const obstacles: unknown[] = [];
+      const allBuildings = [...houses, ...workplaces, ...taverns, ...clinics, ...restaurants, ...bathhouses];
+
+      allBuildings.forEach((building) => {
         const position = building.mesh.position;
+        const config = BUILDING_CONFIGS[building.type];
+        const params = config.obstacleParams;
 
-        // Use appropriate obstacle type based on building type
-        if (building.type === "workplace") {
-          // Workplace is a cylinder
+        if (config.obstacleType === "cylinder") {
           const obstacle = tileCache.addCylinderObstacle(
             { x: position.x, y: position.y, z: position.z },
-            0.375, // radius (diameter 0.75 / 2)
-            0.75   // height
-          );
-          obstacles.push(obstacle);
-        } else if (building.type === "tavern") {
-          // Tavern is a cone/pyramid - use cylinder obstacle with average radius
-          const obstacle = tileCache.addCylinderObstacle(
-            { x: position.x, y: position.y, z: position.z },
-            0.375, // radius (diameter 0.75 / 2)
-            0.6    // height
+            params.radius!,
+            params.height
           );
           obstacles.push(obstacle);
         } else {
-          // House and clinic are boxes
+          // Box obstacle
           const obstacle = tileCache.addBoxObstacle(
             { x: position.x, y: position.y, z: position.z },
-            { x: 0.375, y: 0.5, z: 0.375 }, // half-extents (width/2, height/2, depth/2)
+            { x: params.width! / 2, y: params.height / 2, z: params.depth! / 2 },
             0
           );
           obstacles.push(obstacle);
@@ -391,16 +441,11 @@ export function Canvas() {
               // Extract building type and index
               const match = meshName.match(/^(\w+)-(\d+)$/);
               if (match) {
-                const buildingType = match[1];
+                const buildingType = match[1] as BuildingType;
                 const buildingIndex = parseInt(match[2]);
 
-                let building: Building | null = null;
-                if (buildingType === "house") building = housesRef.current[buildingIndex];
-                else if (buildingType === "workplace") building = workplacesRef.current[buildingIndex];
-                else if (buildingType === "tavern") building = tavernsRef.current[buildingIndex];
-                else if (buildingType === "clinic") building = clinicsRef.current[buildingIndex];
-                else if (buildingType === "restaurant") building = restaurantsRef.current[buildingIndex];
-                else if (buildingType === "bathhouse") building = bathhousesRef.current[buildingIndex];
+                const buildings = buildingsRef.current.get(buildingType);
+                const building = buildings ? buildings[buildingIndex] : null;
 
                 if (building) {
                   console.log("Clicked on building:", buildingType, buildingIndex, "rightClick:", isRightClick);
@@ -482,7 +527,7 @@ export function Canvas() {
       });
 
       // Start simulation
-      startSimulation(workers, crowd, navigationPlugin, taverns, clinics, restaurants, bathhouses);
+      startSimulation(workers, crowd, navigationPlugin, taverns, clinics, restaurants, bathhouses, addAlert);
     })();
 
     // Render loop
@@ -516,26 +561,145 @@ export function Canvas() {
       scene.dispose();
       engine.dispose();
     };
-   
-  }, []);
+
+  }, [addAlert]);
+
+  // Monitor worker conditions and generate alerts
+  useEffect(() => {
+    const alertedConditions = new Map<number, Set<string>>(); // Track which conditions have been alerted for each worker
+    const conditionTimers = new Map<number, Map<string, number>>(); // Track how long a condition has persisted
+
+    const monitorInterval = setInterval(() => {
+      const workers = workersRef.current;
+
+      workers.forEach(worker => {
+        if (!alertedConditions.has(worker.agentIndex)) {
+          alertedConditions.set(worker.agentIndex, new Set());
+        }
+        if (!conditionTimers.has(worker.agentIndex)) {
+          conditionTimers.set(worker.agentIndex, new Map());
+        }
+        const workerAlerts = alertedConditions.get(worker.agentIndex)!;
+        const timers = conditionTimers.get(worker.agentIndex)!;
+
+        // Helper to check if condition has persisted long enough
+        const checkCondition = (conditionKey: string, threshold: number = 0): boolean => {
+          const currentTime = timers.get(conditionKey) || 0;
+          timers.set(conditionKey, currentTime + 5000); // Add 5 seconds
+          return currentTime >= threshold;
+        };
+
+        const resetCondition = (conditionKey: string) => {
+          timers.delete(conditionKey);
+        };
+
+        // Critical health
+        if (worker.health < 20 && worker.health > 0) {
+          if (!workerAlerts.has('critical_health') && checkCondition('critical_health', 0)) {
+            addAlert("critical", "💀", `Worker #${worker.agentIndex} has critical health (${worker.health.toFixed(0)})`);
+            workerAlerts.add('critical_health');
+          }
+        } else {
+          workerAlerts.delete('critical_health');
+          resetCondition('critical_health');
+        }
+
+        // Critical happiness
+        if (worker.happiness < 20) {
+          if (!workerAlerts.has('critical_happiness') && checkCondition('critical_happiness', 0)) {
+            addAlert("warning", "😢", `Worker #${worker.agentIndex} is very unhappy (${worker.happiness.toFixed(0)})`);
+            workerAlerts.add('critical_happiness');
+          }
+        } else {
+          workerAlerts.delete('critical_happiness');
+          resetCondition('critical_happiness');
+        }
+
+        // Starvation
+        if (worker.hunger < 15) {
+          if (!workerAlerts.has('starvation') && checkCondition('starvation', 0)) {
+            addAlert("critical", "🍽️", `Worker #${worker.agentIndex} is starving (hunger: ${worker.hunger.toFixed(0)})`);
+            workerAlerts.add('starvation');
+          }
+        } else {
+          workerAlerts.delete('starvation');
+          resetCondition('starvation');
+        }
+
+        // Exhaustion
+        if (worker.energy < 15) {
+          if (!workerAlerts.has('exhaustion') && checkCondition('exhaustion', 0)) {
+            addAlert("warning", "😴", `Worker #${worker.agentIndex} is exhausted (energy: ${worker.energy.toFixed(0)})`);
+            workerAlerts.add('exhaustion');
+          }
+        } else {
+          workerAlerts.delete('exhaustion');
+          resetCondition('exhaustion');
+        }
+
+        // Low social
+        if (worker.social < 15) {
+          if (!workerAlerts.has('low_social') && checkCondition('low_social', 10000)) { // 10 seconds
+            addAlert("info", "🎭", `Worker #${worker.agentIndex} feels isolated (social: ${worker.social.toFixed(0)})`);
+            workerAlerts.add('low_social');
+          }
+        } else {
+          workerAlerts.delete('low_social');
+          resetCondition('low_social');
+        }
+
+        // Poor hygiene
+        if (worker.hygiene < 15) {
+          if (!workerAlerts.has('poor_hygiene') && checkCondition('poor_hygiene', 10000)) { // 10 seconds
+            addAlert("info", "🛁", `Worker #${worker.agentIndex} has poor hygiene (${worker.hygiene.toFixed(0)})`);
+            workerAlerts.add('poor_hygiene');
+          }
+        } else {
+          workerAlerts.delete('poor_hygiene');
+          resetCondition('poor_hygiene');
+        }
+
+        // Homelessness - only alert after 15 seconds
+        if (!worker.house) {
+          if (!workerAlerts.has('homeless') && checkCondition('homeless', 15000)) {
+            addAlert("warning", "🏠", `Worker #${worker.agentIndex} is homeless`);
+            workerAlerts.add('homeless');
+          }
+        } else {
+          workerAlerts.delete('homeless');
+          resetCondition('homeless');
+        }
+
+        // Unemployment - only alert after 20 seconds
+        if (!worker.workplace) {
+          if (!workerAlerts.has('unemployed') && checkCondition('unemployed', 20000)) {
+            addAlert("info", "💼", `Worker #${worker.agentIndex} is unemployed`);
+            workerAlerts.add('unemployed');
+          }
+        } else {
+          workerAlerts.delete('unemployed');
+          resetCondition('unemployed');
+        }
+      });
+    }, 5000); // Check every 5 seconds
+
+    return () => clearInterval(monitorInterval);
+  }, [addAlert]);
 
   // Helper functions for dynamic building/worker creation
-  const addBuilding = (type: "house" | "workplace" | "tavern" | "clinic" | "restaurant" | "bathhouse") => {
+  const addBuilding = (type: BuildingType) => {
     const scene = sceneRef.current;
     const tileCache = tileCacheRef.current;
     const navigationPlugin = navigationPluginRef.current;
 
     if (!scene || !tileCache || !navigationPlugin) return;
 
-    let newBuilding: Building;
-    const existingPositions = [
-      ...housesRef.current.map(b => b.mesh.position),
-      ...workplacesRef.current.map(b => b.mesh.position),
-      ...tavernsRef.current.map(b => b.mesh.position),
-      ...clinicsRef.current.map(b => b.mesh.position),
-      ...restaurantsRef.current.map(b => b.mesh.position),
-      ...bathhousesRef.current.map(b => b.mesh.position),
-    ];
+    const config = BUILDING_CONFIGS[type];
+    const existingBuildings = getBuildings(type);
+    const index = existingBuildings.length;
+
+    // Get all existing building positions
+    const existingPositions = getAllBuildings().map(b => b.mesh.position);
 
     // Find non-overlapping position
     let x: number, z: number, position: Vector3;
@@ -547,120 +711,72 @@ export function Canvas() {
       attempts++;
     } while (isTooClose(position, existingPositions, 2.5) && attempts < 50);
 
-    if (type === "house") {
-      const index = housesRef.current.length;
-      const houseMat = new StandardMaterial(`houseMat-${index}`, scene);
-      houseMat.diffuseColor = new Color3(0.8, 0.6, 0.4);
-      const house = MeshBuilder.CreateBox(`house-${index}`, { width: 0.75, height: 0.5, depth: 0.75 }, scene);
-      house.position = new Vector3(x, 0.25, z);
-      house.material = houseMat;
-      house.isPickable = true; // Make buildings clickable
-      newBuilding = { mesh: house, entranceZone: new Vector3(x + 0.8, 0, z), type: "house", workers: [], capacity: 4 };
-      housesRef.current.push(newBuilding);
-    } else if (type === "workplace") {
-      const index = workplacesRef.current.length;
-      const workMat = new StandardMaterial(`workMat-${index}`, scene);
-      workMat.diffuseColor = new Color3(0.5, 0.5, 0.7);
-      const workplace = MeshBuilder.CreateCylinder(`workplace-${index}`, { height: 0.75, diameter: 0.75 }, scene);
-      workplace.position = new Vector3(x, 0.375, z);
-      workplace.material = workMat;
-      workplace.isPickable = true; // Make buildings clickable
-      newBuilding = { mesh: workplace, entranceZone: new Vector3(x + 0.8, 0, z), type: "workplace", workers: [], capacity: 5 };
-      workplacesRef.current.push(newBuilding);
-    } else if (type === "tavern") {
-      const index = tavernsRef.current.length;
-      const tavernMat = new StandardMaterial(`tavernMat-${index}`, scene);
-      tavernMat.diffuseColor = new Color3(0.7, 0.3, 0.3);
-      const tavern = MeshBuilder.CreateCylinder(`tavern-${index}`, {
-        height: 0.6,
-        diameterTop: 0,
-        diameterBottom: 0.75
-      }, scene);
-      tavern.position = new Vector3(x, 0.3, z);
-      tavern.material = tavernMat;
-      tavern.isPickable = true; // Make buildings clickable
-      newBuilding = { mesh: tavern, entranceZone: new Vector3(x + 0.8, 0, z), type: "tavern", workers: [], capacity: 999 };
-      tavernsRef.current.push(newBuilding);
-    } else if (type === "clinic") {
-      const index = clinicsRef.current.length;
-      const clinicMat = new StandardMaterial(`clinicMat-${index}`, scene);
-      clinicMat.diffuseColor = new Color3(0.3, 0.8, 0.3);
-      const clinic = MeshBuilder.CreateBox(`clinic-${index}`, { width: 0.75, height: 0.5, depth: 0.75 }, scene);
-      clinic.position = new Vector3(x, 0.25, z);
-      clinic.material = clinicMat;
-      clinic.isPickable = true; // Make buildings clickable
-      newBuilding = { mesh: clinic, entranceZone: new Vector3(x + 0.8, 0, z), type: "clinic", workers: [], capacity: 999 };
-      clinicsRef.current.push(newBuilding);
-    } else if (type === "restaurant") {
-      const index = restaurantsRef.current.length;
-      const restaurantMat = new StandardMaterial(`restaurantMat-${index}`, scene);
-      restaurantMat.diffuseColor = new Color3(1.0, 0.7, 0.2);
-      const restaurant = MeshBuilder.CreateBox(`restaurant-${index}`, { width: 0.9, height: 0.6, depth: 0.75 }, scene);
-      restaurant.position = new Vector3(x, 0.3, z);
-      restaurant.material = restaurantMat;
-      restaurant.isPickable = true; // Make buildings clickable
-      newBuilding = { mesh: restaurant, entranceZone: new Vector3(x + 0.8, 0, z), type: "restaurant", workers: [], capacity: 999 };
-      restaurantsRef.current.push(newBuilding);
-    } else {
-      const index = bathhousesRef.current.length;
-      const bathhouseMat = new StandardMaterial(`bathhouseMat-${index}`, scene);
-      bathhouseMat.diffuseColor = new Color3(0.4, 0.6, 0.9);
-      const bathhouse = MeshBuilder.CreateCylinder(`bathhouse-${index}`, { height: 0.5, diameter: 0.8 }, scene);
-      bathhouse.position = new Vector3(x, 0.25, z);
-      bathhouse.material = bathhouseMat;
-      bathhouse.isPickable = true; // Make buildings clickable
-      newBuilding = { mesh: bathhouse, entranceZone: new Vector3(x + 0.8, 0, z), type: "bathhouse", workers: [], capacity: 999 };
-      bathhousesRef.current.push(newBuilding);
+    // Create material
+    const material = new StandardMaterial(`${type}Mat-${index}`, scene);
+    material.diffuseColor = new Color3(config.color.r, config.color.g, config.color.b);
+
+    // Create mesh based on shape
+    let mesh: Mesh;
+    let yPosition: number;
+
+    if (config.shape === "box") {
+      mesh = MeshBuilder.CreateBox(`${type}-${index}`, config.dimensions, scene);
+      yPosition = config.dimensions.height / 2;
+    } else if (config.shape === "cylinder") {
+      mesh = MeshBuilder.CreateCylinder(`${type}-${index}`, config.dimensions, scene);
+      yPosition = config.dimensions.height / 2;
+    } else { // cone
+      mesh = MeshBuilder.CreateCylinder(`${type}-${index}`, config.dimensions, scene);
+      yPosition = config.dimensions.height / 2;
     }
 
-    // Add obstacle to navmesh using appropriate type
+    mesh.position = new Vector3(x, yPosition, z);
+    mesh.material = material;
+    mesh.isPickable = true;
+
+    // Create building object
+    const newBuilding: Building = {
+      mesh,
+      entranceZone: new Vector3(x + 0.8, 0, z),
+      type,
+      workers: [],
+      capacity: config.capacity,
+      clientCapacity: config.clientCapacity,
+      currentClients: config.clientCapacity ? [] : undefined
+    };
+
+    // Add to storage
+    addBuildingToStorage(type, newBuilding);
+
+    // Add obstacle to navmesh using configuration
     const buildingPos = newBuilding.mesh.position;
+    const params = config.obstacleParams;
 
-    if (type === "workplace") {
-      // Workplace is a cylinder
-      tileCache.addCylinderObstacle(
+    if (config.obstacleType === "cylinder") {
+      (tileCache as any).addCylinderObstacle(
         { x: buildingPos.x, y: buildingPos.y, z: buildingPos.z },
-        0.375, // radius (diameter 0.75 / 2)
-        0.75   // height
-      );
-    } else if (type === "tavern") {
-      // Tavern is a cone/pyramid - use cylinder obstacle
-      tileCache.addCylinderObstacle(
-        { x: buildingPos.x, y: buildingPos.y, z: buildingPos.z },
-        0.375, // radius (diameter 0.75 / 2)
-        0.6    // height
-      );
-    } else if (type === "bathhouse") {
-      // Bathhouse is a cylinder
-      tileCache.addCylinderObstacle(
-        { x: buildingPos.x, y: buildingPos.y, z: buildingPos.z },
-        0.4,   // radius (diameter 0.8 / 2)
-        0.5    // height
-      );
-    } else if (type === "restaurant") {
-      // Restaurant is a box
-      tileCache.addBoxObstacle(
-        { x: buildingPos.x, y: buildingPos.y, z: buildingPos.z },
-        { x: 0.45, y: 0.6, z: 0.375 }, // half-extents (width/2, height/2, depth/2)
-        0
+        params.radius!,
+        params.height
       );
     } else {
-      // House and clinic are boxes
-      tileCache.addBoxObstacle(
+      (tileCache as any).addBoxObstacle(
         { x: buildingPos.x, y: buildingPos.y, z: buildingPos.z },
-        { x: 0.375, y: 0.5, z: 0.375 }, // half-extents (width/2, height/2, depth/2)
+        { x: params.width! / 2, y: params.height / 2, z: params.depth! / 2 },
         0
       );
     }
 
-    console.log(`Added ${type} at position (${x.toFixed(2)}, ${z.toFixed(2)})`);
+    console.log(`Added ${config.displayName} at position (${x.toFixed(2)}, ${z.toFixed(2)})`);
+
+    // Trigger Stats panel update
+    setStatsUpdateTrigger(prev => prev + 1);
   };
 
   const addWorker = () => {
     const scene = sceneRef.current;
     const crowd = crowdRef.current;
     const navigationPlugin = navigationPluginRef.current;
-    const houses = housesRef.current;
+    const houses = getBuildings("house");
 
     if (!scene || !crowd || !navigationPlugin) return;
 
@@ -737,6 +853,9 @@ export function Canvas() {
     } else {
       console.log(`Added worker with agentIndex ${agentIndex} at corner (homeless - no houses available, unemployed)`);
     }
+
+    // Trigger Stats panel update
+    setStatsUpdateTrigger(prev => prev + 1);
   };
 
   const changeWorkerWorkplace = (worker: Worker, workplace: Building | null) => {
@@ -795,9 +914,9 @@ export function Canvas() {
         if (house.workers.length < house.capacity) {
           house.workers.push(worker.agentIndex);
           workerInRef.house = house;
-          console.log(`Worker ${worker.agentIndex} house changed to House ${housesRef.current.indexOf(house)}`);
+          console.log(`Worker ${worker.agentIndex} house changed to House ${getBuildingIndex(house)}`);
         } else {
-          console.log(`House ${housesRef.current.indexOf(house)} is full! Capacity: ${house.capacity}`);
+          console.log(`House ${getBuildingIndex(house)} is full! Capacity: ${house.capacity}`);
           return; // Don't change if house is full
         }
       } else {
@@ -878,30 +997,19 @@ export function Canvas() {
           left: 220,
           background: "rgba(0, 0, 0, 0.9)",
           color: "white",
-          padding: "20px",
+          padding: "12px 15px",
           borderRadius: "8px",
-          minWidth: "300px",
-          maxWidth: "400px",
-          maxHeight: "80vh",
+          minWidth: "280px",
+          maxWidth: "350px",
+          maxHeight: "55vh",
           overflowY: "auto",
           boxShadow: "0 4px 6px rgba(0, 0, 0, 0.3)",
           zIndex: 1000,
+          fontSize: "13px",
         }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "15px" }}>
-            <h2 style={{ margin: 0, fontSize: "20px" }}>
-              {selectedBuilding.type === "house" && "🏠 House"}
-              {selectedBuilding.type === "workplace" && "🏢 Workplace"}
-              {selectedBuilding.type === "tavern" && "🍺 Tavern"}
-              {selectedBuilding.type === "clinic" && "🏥 Clinic"}
-              {selectedBuilding.type === "restaurant" && "🍽️ Restaurant"}
-              {selectedBuilding.type === "bathhouse" && "🛁 Bathhouse"}
-              {" "}
-              {selectedBuilding.type === "house" && housesRef.current.findIndex(b => b.mesh === selectedBuilding.mesh)}
-              {selectedBuilding.type === "workplace" && workplacesRef.current.findIndex(b => b.mesh === selectedBuilding.mesh)}
-              {selectedBuilding.type === "tavern" && tavernsRef.current.findIndex(b => b.mesh === selectedBuilding.mesh)}
-              {selectedBuilding.type === "clinic" && clinicsRef.current.findIndex(b => b.mesh === selectedBuilding.mesh)}
-              {selectedBuilding.type === "restaurant" && restaurantsRef.current.findIndex(b => b.mesh === selectedBuilding.mesh)}
-              {selectedBuilding.type === "bathhouse" && bathhousesRef.current.findIndex(b => b.mesh === selectedBuilding.mesh)}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+            <h2 style={{ margin: 0, fontSize: "16px" }}>
+              {BUILDING_CONFIGS[selectedBuilding.type].emoji} {BUILDING_CONFIGS[selectedBuilding.type].displayName} {getBuildingIndex(selectedBuilding)}
             </h2>
             <button
               onClick={() => setShowBuildingPanel(false)}
@@ -910,25 +1018,25 @@ export function Canvas() {
                 color: "white",
                 border: "none",
                 borderRadius: "4px",
-                padding: "5px 10px",
+                padding: "4px 8px",
                 cursor: "pointer",
-                fontSize: "14px",
+                fontSize: "12px",
               }}
             >
               ✕
             </button>
           </div>
 
-          <hr style={{ margin: "15px 0", border: "1px solid #555" }} />
+          <hr style={{ margin: "8px 0", border: "1px solid #555" }} />
 
           {/* For service buildings, show staff and client info separately */}
           {(selectedBuilding.type === "clinic" || selectedBuilding.type === "restaurant" || selectedBuilding.type === "bathhouse" || selectedBuilding.type === "tavern") ? (
             <>
               <div style={{ marginBottom: "15px" }}>
                 <strong>�‍⚕️ Staff:</strong>
-                <div style={{ fontSize: "24px", marginTop: "5px" }}>
+                <span style={{ fontSize: "16px", marginLeft: "8px" }}>
                   {selectedBuilding.workers.length} / {selectedBuilding.capacity}
-                </div>
+                </span>
                 <div style={{
                   width: "100%",
                   height: "10px",
@@ -1183,23 +1291,25 @@ export function Canvas() {
           right: 10,
           background: "rgba(0, 0, 0, 0.9)",
           color: "white",
-          padding: "20px",
-          borderRadius: "10px",
-          minWidth: "320px",
-          maxWidth: "350px",
+          padding: "12px 15px",
+          borderRadius: "8px",
+          minWidth: "280px",
+          maxWidth: "320px",
           fontFamily: "Arial, sans-serif",
-          maxHeight: "90vh",
+          maxHeight: "55vh",
           overflowY: "auto",
+          fontSize: "13px",
         }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "15px" }}>
-            <h2 style={{ margin: 0, fontSize: "18px" }}>👷 Worker #{selectedWorker.agentIndex}</h2>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+            <h2 style={{ margin: 0, fontSize: "16px" }}>👷 Worker #{selectedWorker.agentIndex}</h2>
             <button onClick={() => setShowWorkerPanel(false)} style={{
               ...buttonStyle,
               background: "#d32f2f",
-              padding: "5px 10px",
+              padding: "4px 8px",
               marginBottom: 0,
+              fontSize: "12px",
             }}>
-              Close
+              ✕
             </button>
           </div>
 
@@ -1349,10 +1459,10 @@ export function Canvas() {
 
           <h3 style={{ margin: "10px 0", fontSize: "16px" }}>🏠 Change House</h3>
           <select
-            value={selectedWorker.house ? housesRef.current.indexOf(selectedWorker.house) : -1}
+            value={selectedWorker.house ? getBuildingIndex(selectedWorker.house) : -1}
             onChange={(e) => {
               const index = parseInt(e.target.value);
-              const house = index >= 0 ? housesRef.current[index] : null;
+              const house = index >= 0 ? getBuildings("house")[index] : null;
               changeWorkerHouse(selectedWorker, house);
             }}
             style={{
@@ -1368,7 +1478,7 @@ export function Canvas() {
             }}
           >
             <option value={-1}>Homeless</option>
-            {housesRef.current.map((house, index) => (
+            {getBuildings("house").map((house, index) => (
               <option key={index} value={index}>
                 House {index} ({house.workers.length}/{house.capacity})
               </option>
@@ -1379,19 +1489,7 @@ export function Canvas() {
           <select
             value={
               selectedWorker.workplace
-                ? (() => {
-                    const wpIndex = workplacesRef.current.indexOf(selectedWorker.workplace);
-                    if (wpIndex !== -1) return `workplace-${wpIndex}`;
-                    const clinicIndex = clinicsRef.current.indexOf(selectedWorker.workplace);
-                    if (clinicIndex !== -1) return `clinic-${clinicIndex}`;
-                    const restaurantIndex = restaurantsRef.current.indexOf(selectedWorker.workplace);
-                    if (restaurantIndex !== -1) return `restaurant-${restaurantIndex}`;
-                    const bathhouseIndex = bathhousesRef.current.indexOf(selectedWorker.workplace);
-                    if (bathhouseIndex !== -1) return `bathhouse-${bathhouseIndex}`;
-                    const tavernIndex = tavernsRef.current.indexOf(selectedWorker.workplace);
-                    if (tavernIndex !== -1) return `tavern-${tavernIndex}`;
-                    return "none";
-                  })()
+                ? `${selectedWorker.workplace.type}-${getBuildingIndex(selectedWorker.workplace)}`
                 : "none"
             }
             onChange={(e) => {
@@ -1401,12 +1499,7 @@ export function Canvas() {
               } else {
                 const [type, indexStr] = value.split("-");
                 const index = parseInt(indexStr);
-                let workplace: Building | null = null;
-                if (type === "workplace") workplace = workplacesRef.current[index];
-                else if (type === "clinic") workplace = clinicsRef.current[index];
-                else if (type === "restaurant") workplace = restaurantsRef.current[index];
-                else if (type === "bathhouse") workplace = bathhousesRef.current[index];
-                else if (type === "tavern") workplace = tavernsRef.current[index];
+                const workplace = getBuildings(type as BuildingType)[index];
                 if (workplace) changeWorkerWorkplace(selectedWorker, workplace);
               }
             }}
@@ -1422,41 +1515,23 @@ export function Canvas() {
             }}
           >
             <option value="none">No Workplace</option>
-            <optgroup label="🏭 Workplaces">
-              {workplacesRef.current.map((workplace, index) => (
-                <option key={`workplace-${index}`} value={`workplace-${index}`}>
-                  Workplace {index} ({workplace.workers.length}/{workplace.capacity})
-                </option>
-              ))}
-            </optgroup>
-            <optgroup label="🏥 Clinics">
-              {clinicsRef.current.map((clinic, index) => (
-                <option key={`clinic-${index}`} value={`clinic-${index}`}>
-                  Clinic {index} ({clinic.workers.length}/{clinic.capacity})
-                </option>
-              ))}
-            </optgroup>
-            <optgroup label="🍽️ Restaurants">
-              {restaurantsRef.current.map((restaurant, index) => (
-                <option key={`restaurant-${index}`} value={`restaurant-${index}`}>
-                  Restaurant {index} ({restaurant.workers.length}/{restaurant.capacity})
-                </option>
-              ))}
-            </optgroup>
-            <optgroup label="🛁 Bathhouses">
-              {bathhousesRef.current.map((bathhouse, index) => (
-                <option key={`bathhouse-${index}`} value={`bathhouse-${index}`}>
-                  Bathhouse {index} ({bathhouse.workers.length}/{bathhouse.capacity})
-                </option>
-              ))}
-            </optgroup>
-            <optgroup label="🍺 Taverns">
-              {tavernsRef.current.map((tavern, index) => (
-                <option key={`tavern-${index}`} value={`tavern-${index}`}>
-                  Tavern {index} ({tavern.workers.length}/{tavern.capacity})
-                </option>
-              ))}
-            </optgroup>
+            {/* Render workplace options dynamically */}
+            {(Object.keys(BUILDING_CONFIGS) as BuildingType[])
+              .filter(type => BUILDING_CONFIGS[type].category !== "residential")
+              .map(buildingType => {
+                const config = BUILDING_CONFIGS[buildingType];
+                const buildings = getBuildings(buildingType);
+
+                return (
+                  <optgroup key={buildingType} label={`${config.emoji} ${config.displayName}s`}>
+                    {buildings.map((building, index) => (
+                      <option key={`${buildingType}-${index}`} value={`${buildingType}-${index}`}>
+                        {config.displayName} {index} ({building.workers.length}/{building.capacity})
+                      </option>
+                    ))}
+                  </optgroup>
+                );
+              })}
           </select>
 
           <div style={{
@@ -1479,7 +1554,9 @@ export function Canvas() {
 
       {/* Stats Panel */}
       {showStatsPanel && (
-        <div style={{
+        <div
+          key={statsUpdateTrigger}
+          style={{
           position: "absolute",
           bottom: 10,
           left: 10,
@@ -1487,9 +1564,9 @@ export function Canvas() {
           color: "white",
           padding: "15px",
           borderRadius: "8px",
-          minWidth: "350px",
-          maxWidth: "450px",
-          maxHeight: "40vh",
+          minWidth: "500px",
+          maxWidth: "600px",
+          maxHeight: "45vh",
           overflowY: "auto",
           boxShadow: "0 4px 6px rgba(0, 0, 0, 0.3)",
           zIndex: 1000,
@@ -1517,18 +1594,67 @@ export function Canvas() {
           {/* Summary Stats */}
           <div style={{ marginBottom: "15px" }}>
             <h3 style={{ margin: "0 0 8px 0", fontSize: "15px" }}>📈 Summary</h3>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", fontSize: "12px" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "8px", fontSize: "12px" }}>
               <div>👷 Workers: <strong>{workersRef.current.length}</strong></div>
-              <div>🏠 Houses: <strong>{housesRef.current.length}</strong></div>
-              <div>🏢 Workplaces: <strong>{workplacesRef.current.length}</strong></div>
-              <div>🍺 Taverns: <strong>{tavernsRef.current.length}</strong></div>
-              <div>🏥 Clinics: <strong>{clinicsRef.current.length}</strong></div>
-              <div>🍽️ Restaurants: <strong>{restaurantsRef.current.length}</strong></div>
-              <div>🛁 Bathhouses: <strong>{bathhousesRef.current.length}</strong></div>
+              <div>🏠 Houses: <strong>{getBuildings("house").length}</strong></div>
+              <div>🏢 Workplaces: <strong>{getBuildings("workplace").length}</strong></div>
+              <div>🍺 Taverns: <strong>{getBuildings("tavern").length}</strong></div>
+              <div>🏥 Clinics: <strong>{getBuildings("clinic").length}</strong></div>
+              <div>🍽️ Restaurants: <strong>{getBuildings("restaurant").length}</strong></div>
+              <div>🛁 Bathhouses: <strong>{getBuildings("bathhouse").length}</strong></div>
               <div>😴 Homeless: <strong style={{ color: "#ff9800" }}>{workersRef.current.filter(w => !w.house).length}</strong></div>
               <div>💼 Unemployed: <strong style={{ color: "#ff9800" }}>{workersRef.current.filter(w => !w.workplace).length}</strong></div>
             </div>
           </div>
+
+          {/* Average Worker Stats */}
+          {workersRef.current.length > 0 && (() => {
+            const workers = workersRef.current;
+            const avgHealth = workers.reduce((sum, w) => sum + w.health, 0) / workers.length;
+            const avgHappiness = workers.reduce((sum, w) => sum + w.happiness, 0) / workers.length;
+            const avgHunger = workers.reduce((sum, w) => sum + w.hunger, 0) / workers.length;
+            const avgEnergy = workers.reduce((sum, w) => sum + w.energy, 0) / workers.length;
+            const avgSocial = workers.reduce((sum, w) => sum + w.social, 0) / workers.length;
+            const avgHygiene = workers.reduce((sum, w) => sum + w.hygiene, 0) / workers.length;
+
+            return (
+              <div style={{ marginBottom: "15px" }}>
+                <h3 style={{ margin: "0 0 8px 0", fontSize: "15px" }}>👥 Population Averages</h3>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "8px", fontSize: "12px" }}>
+                  <div>
+                    ❤️ Health: <strong style={{ color: avgHealth > 60 ? "#4caf50" : avgHealth > 30 ? "#ff9800" : "#f44336" }}>
+                      {avgHealth.toFixed(1)}
+                    </strong>
+                  </div>
+                  <div>
+                    😊 Happiness: <strong style={{ color: avgHappiness > 60 ? "#4caf50" : avgHappiness > 30 ? "#ff9800" : "#f44336" }}>
+                      {avgHappiness.toFixed(1)}
+                    </strong>
+                  </div>
+                  <div>
+                    🍽️ Hunger: <strong style={{ color: avgHunger > 60 ? "#4caf50" : avgHunger > 30 ? "#ff9800" : "#f44336" }}>
+                      {avgHunger.toFixed(1)}
+                    </strong>
+                  </div>
+                  <div>
+                    ⚡ Energy: <strong style={{ color: avgEnergy > 60 ? "#4caf50" : avgEnergy > 30 ? "#ff9800" : "#f44336" }}>
+                      {avgEnergy.toFixed(1)}
+                    </strong>
+                  </div>
+                  <div>
+                    🎭 Social: <strong style={{ color: avgSocial > 60 ? "#4caf50" : avgSocial > 30 ? "#ff9800" : "#f44336" }}>
+                      {avgSocial.toFixed(1)}
+                    </strong>
+                  </div>
+                  <div>
+                    🛁 Hygiene: <strong style={{ color: avgHygiene > 60 ? "#4caf50" : avgHygiene > 30 ? "#ff9800" : "#f44336" }}>
+                      {avgHygiene.toFixed(1)}
+                    </strong>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
 
           <hr style={{ margin: "10px 0", border: "1px solid #555" }} />
 
@@ -1536,144 +1662,40 @@ export function Canvas() {
           <div style={{ marginBottom: "15px" }}>
             <h3 style={{ margin: "0 0 8px 0", fontSize: "15px" }}>🏗️ Buildings</h3>
             <div style={{ maxHeight: "150px", overflowY: "auto" }}>
-              {/* Houses */}
-              {housesRef.current.map((house, index) => (
-                <div
-                  key={`stats-house-${index}`}
-                  onClick={() => {
-                    setSelectedBuilding(house);
-                    setShowBuildingPanel(true);
-                  }}
-                  style={{
-                    padding: "6px 8px",
-                    marginBottom: "4px",
-                    background: selectedBuilding === house ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
-                    borderRadius: "4px",
-                    cursor: "pointer",
-                    transition: "background 0.2s",
-                    fontSize: "12px",
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
-                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === house ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
-                >
-                  🏠 House {index} - {house.workers.length}/{house.capacity}
-                </div>
-              ))}
-              {/* Workplaces */}
-              {workplacesRef.current.map((workplace, index) => (
-                <div
-                  key={`stats-workplace-${index}`}
-                  onClick={() => {
-                    setSelectedBuilding(workplace);
-                    setShowBuildingPanel(true);
-                  }}
-                  style={{
-                    padding: "6px 8px",
-                    marginBottom: "4px",
-                    background: selectedBuilding === workplace ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
-                    borderRadius: "4px",
-                    cursor: "pointer",
-                    transition: "background 0.2s",
-                    fontSize: "12px",
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
-                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === workplace ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
-                >
-                  🏢 Workplace {index} - {workplace.workers.length}/{workplace.capacity}
-                </div>
-              ))}
-              {/* Taverns */}
-              {tavernsRef.current.map((tavern, index) => (
-                <div
-                  key={`stats-tavern-${index}`}
-                  onClick={() => {
-                    setSelectedBuilding(tavern);
-                    setShowBuildingPanel(true);
-                  }}
-                  style={{
-                    padding: "6px 8px",
-                    marginBottom: "4px",
-                    background: selectedBuilding === tavern ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
-                    borderRadius: "4px",
-                    cursor: "pointer",
-                    transition: "background 0.2s",
-                    fontSize: "12px",
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
-                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === tavern ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
-                >
-                  🍺 Tavern {index} - Staff: {tavern.workers.length}/{tavern.capacity}
-                </div>
-              ))}
-              {/* Clinics */}
-              {clinicsRef.current.map((clinic, index) => (
-                <div
-                  key={`stats-clinic-${index}`}
-                  onClick={() => {
-                    setSelectedBuilding(clinic);
-                    setShowBuildingPanel(true);
-                  }}
-                  style={{
-                    padding: "6px 8px",
-                    marginBottom: "4px",
-                    background: selectedBuilding === clinic ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
-                    borderRadius: "4px",
-                    cursor: "pointer",
-                    transition: "background 0.2s",
-                    fontSize: "12px",
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
-                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === clinic ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
-                >
-                  🏥 Clinic {index} - Staff: {clinic.workers.length}/{clinic.capacity}
-                </div>
-              ))}
-              {/* Restaurants */}
-              {restaurantsRef.current.map((restaurant, index) => (
-                <div
-                  key={`stats-restaurant-${index}`}
-                  onClick={() => {
-                    setSelectedBuilding(restaurant);
-                    setShowBuildingPanel(true);
-                  }}
-                  style={{
-                    padding: "6px 8px",
-                    marginBottom: "4px",
-                    background: selectedBuilding === restaurant ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
-                    borderRadius: "4px",
-                    cursor: "pointer",
-                    transition: "background 0.2s",
-                    fontSize: "12px",
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
-                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === restaurant ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
-                >
-                  🍽️ Restaurant {index} - Staff: {restaurant.workers.length}/{restaurant.capacity}
-                </div>
-              ))}
-              {/* Bathhouses */}
-              {bathhousesRef.current.map((bathhouse, index) => (
-                <div
-                  key={`stats-bathhouse-${index}`}
-                  onClick={() => {
-                    setSelectedBuilding(bathhouse);
-                    setShowBuildingPanel(true);
-                  }}
-                  style={{
-                    padding: "6px 8px",
-                    marginBottom: "4px",
-                    background: selectedBuilding === bathhouse ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
-                    borderRadius: "4px",
-                    cursor: "pointer",
-                    transition: "background 0.2s",
-                    fontSize: "12px",
-                  }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
-                  onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === bathhouse ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
-                >
-                  🛁 Bathhouse {index} - Staff: {bathhouse.workers.length}/{bathhouse.capacity}
-                </div>
-              ))}
+              {/* Render all building types dynamically */}
+              {(Object.keys(BUILDING_CONFIGS) as BuildingType[]).map(buildingType => {
+                const config = BUILDING_CONFIGS[buildingType];
+                const buildings = getBuildings(buildingType);
+
+                return buildings.map((building, index) => {
+                  const label = config.category === "residential"
+                    ? `${building.workers.length}/${building.capacity}`
+                    : `Staff: ${building.workers.length}/${building.capacity}`;
+
+                  return (
+                    <div
+                      key={`stats-${buildingType}-${index}`}
+                      onClick={() => {
+                        setSelectedBuilding(building);
+                        setShowBuildingPanel(true);
+                      }}
+                      style={{
+                        padding: "6px 8px",
+                        marginBottom: "4px",
+                        background: selectedBuilding === building ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)",
+                        borderRadius: "4px",
+                        cursor: "pointer",
+                        transition: "background 0.2s",
+                        fontSize: "12px",
+                      }}
+                      onMouseEnter={(e) => e.currentTarget.style.background = "rgba(255, 255, 255, 0.15)"}
+                      onMouseLeave={(e) => e.currentTarget.style.background = selectedBuilding === building ? "rgba(255, 255, 255, 0.2)" : "rgba(255, 255, 255, 0.05)"}
+                    >
+                      {config.emoji} {config.displayName} {index} - {label}
+                    </div>
+                  );
+                });
+              })}
             </div>
           </div>
 
@@ -1710,14 +1732,8 @@ export function Canvas() {
                     🍽️ {worker.hunger.toFixed(0)} | ⚡ {worker.energy.toFixed(0)}
                   </div>
                   <div style={{ color: "#999", fontSize: "10px", marginTop: "2px" }}>
-                    {worker.house ? `🏠 House ${housesRef.current.indexOf(worker.house)}` : "😴 Homeless"} |
-                    {worker.workplace ? ` 💼 ${worker.workplace.type} ${
-                      worker.workplace.type === "workplace" ? workplacesRef.current.indexOf(worker.workplace) :
-                      worker.workplace.type === "clinic" ? clinicsRef.current.indexOf(worker.workplace) :
-                      worker.workplace.type === "restaurant" ? restaurantsRef.current.indexOf(worker.workplace) :
-                      worker.workplace.type === "bathhouse" ? bathhousesRef.current.indexOf(worker.workplace) :
-                      worker.workplace.type === "tavern" ? tavernsRef.current.indexOf(worker.workplace) : "?"
-                    }` : " 💼 Unemployed"}
+                    {worker.house ? `🏠 House ${getBuildingIndex(worker.house)}` : "😴 Homeless"} |
+                    {worker.workplace ? ` 💼 ${worker.workplace.type} ${getBuildingIndex(worker.workplace)}` : " 💼 Unemployed"}
                   </div>
                 </div>
               ))}
@@ -1745,6 +1761,218 @@ export function Canvas() {
           }}
         >
           📊 Show Stats
+        </button>
+      )}
+
+      {/* Attention Panel - Bottom Right */}
+      {showAttentionPanel && (
+        <div style={{
+          position: "absolute",
+          bottom: 10,
+          right: 10,
+          background: "rgba(0, 0, 0, 0.9)",
+          color: "white",
+          padding: "15px",
+          borderRadius: "8px",
+          minWidth: "350px",
+          maxWidth: "400px",
+          maxHeight: "45vh",
+          overflowY: "auto",
+          boxShadow: "0 4px 6px rgba(0, 0, 0, 0.3)",
+          zIndex: 1000,
+          fontSize: "13px",
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+            <h2 style={{ margin: 0, fontSize: "16px" }}>⚠️ Attention Panel</h2>
+            <button
+              onClick={() => setShowAttentionPanel(false)}
+              style={{
+                background: "#f44336",
+                color: "white",
+                border: "none",
+                borderRadius: "4px",
+                padding: "4px 8px",
+                cursor: "pointer",
+                fontSize: "12px",
+              }}
+            >
+              ✕
+            </button>
+          </div>
+
+          <hr style={{ margin: "8px 0", border: "1px solid #555" }} />
+
+          {/* Filter Buttons */}
+          <div style={{ marginBottom: "12px" }}>
+            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+              <button
+                onClick={() => setAlertFilter("all")}
+                style={{
+                  flex: 1,
+                  minWidth: "70px",
+                  background: alertFilter === "all" ? "#4caf50" : "#555",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "4px",
+                  padding: "6px 10px",
+                  cursor: "pointer",
+                  fontSize: "11px",
+                  fontWeight: alertFilter === "all" ? "bold" : "normal",
+                }}
+              >
+                All ({alerts.length})
+              </button>
+              <button
+                onClick={() => setAlertFilter("critical")}
+                style={{
+                  flex: 1,
+                  minWidth: "70px",
+                  background: alertFilter === "critical" ? "#f44336" : "#555",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "4px",
+                  padding: "6px 10px",
+                  cursor: "pointer",
+                  fontSize: "11px",
+                  fontWeight: alertFilter === "critical" ? "bold" : "normal",
+                }}
+              >
+                🔴 Critical ({alerts.filter(a => a.type === "critical").length})
+              </button>
+              <button
+                onClick={() => setAlertFilter("warning")}
+                style={{
+                  flex: 1,
+                  minWidth: "70px",
+                  background: alertFilter === "warning" ? "#ff9800" : "#555",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "4px",
+                  padding: "6px 10px",
+                  cursor: "pointer",
+                  fontSize: "11px",
+                  fontWeight: alertFilter === "warning" ? "bold" : "normal",
+                }}
+              >
+                🟠 Warning ({alerts.filter(a => a.type === "warning").length})
+              </button>
+              <button
+                onClick={() => setAlertFilter("info")}
+                style={{
+                  flex: 1,
+                  minWidth: "70px",
+                  background: alertFilter === "info" ? "#2196f3" : "#555",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "4px",
+                  padding: "6px 10px",
+                  cursor: "pointer",
+                  fontSize: "11px",
+                  fontWeight: alertFilter === "info" ? "bold" : "normal",
+                }}
+              >
+                🔵 Info ({alerts.filter(a => a.type === "info").length})
+              </button>
+            </div>
+          </div>
+
+          <hr style={{ margin: "8px 0", border: "1px solid #555" }} />
+
+          {/* Alerts List */}
+          <div style={{ marginBottom: "10px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+              <h3 style={{ margin: 0, fontSize: "14px" }}>📋 Recent Alerts</h3>
+              {alerts.length > 0 && (
+                <button
+                  onClick={() => setAlerts([])}
+                  style={{
+                    background: "#555",
+                    color: "white",
+                    border: "none",
+                    borderRadius: "4px",
+                    padding: "3px 8px",
+                    cursor: "pointer",
+                    fontSize: "11px",
+                  }}
+                >
+                  Clear All
+                </button>
+              )}
+            </div>
+
+            <div style={{ maxHeight: "25vh", overflowY: "auto" }}>
+              {(() => {
+                const filteredAlerts = alertFilter === "all"
+                  ? alerts
+                  : alerts.filter(a => a.type === alertFilter);
+
+                if (filteredAlerts.length === 0) {
+                  return (
+                    <div style={{ color: "#999", fontStyle: "italic", padding: "10px 0", textAlign: "center" }}>
+                      {alerts.length === 0
+                        ? "✅ No alerts - everything is running smoothly!"
+                        : `No ${alertFilter} alerts`}
+                    </div>
+                  );
+                }
+
+                return filteredAlerts.map(alert => {
+                  const bgColor = alert.type === "critical" ? "rgba(244, 67, 54, 0.15)" :
+                                  alert.type === "warning" ? "rgba(255, 152, 0, 0.15)" :
+                                  "rgba(33, 150, 243, 0.15)";
+                  const borderColor = alert.type === "critical" ? "#f44336" :
+                                      alert.type === "warning" ? "#ff9800" :
+                                      "#2196f3";
+
+                  return (
+                    <div
+                      key={alert.id}
+                      style={{
+                        background: bgColor,
+                        borderLeft: `3px solid ${borderColor}`,
+                        padding: "8px 10px",
+                        marginBottom: "6px",
+                        borderRadius: "4px",
+                        fontSize: "12px",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        <span style={{ fontSize: "16px" }}>{alert.icon}</span>
+                        <span style={{ flex: 1 }}>{alert.message}</span>
+                      </div>
+                      <div style={{ color: "#999", fontSize: "10px", marginTop: "4px", marginLeft: "24px" }}>
+                        {new Date(alert.timestamp).toLocaleTimeString()}
+                      </div>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toggle Attention Panel Button */}
+      {!showAttentionPanel && (
+        <button
+          onClick={() => setShowAttentionPanel(true)}
+          style={{
+            position: "absolute",
+            bottom: 10,
+            right: 10,
+            background: alerts.some(a => a.type === "critical") ? "rgba(244, 67, 54, 0.9)" :
+                       alerts.some(a => a.type === "warning") ? "rgba(255, 152, 0, 0.9)" :
+                       "rgba(0, 0, 0, 0.7)",
+            color: "white",
+            border: "none",
+            borderRadius: "8px",
+            padding: "10px 15px",
+            cursor: "pointer",
+            fontSize: "14px",
+            fontWeight: "bold",
+          }}
+        >
+          ⚠️ Alerts ({alerts.length})
         </button>
       )}
 
@@ -1829,10 +2057,40 @@ function createAgentMesh(
 }
 
 // Types
+type BuildingType = "house" | "workplace" | "tavern" | "clinic" | "restaurant" | "bathhouse";
+
+type BuildingCategory = "residential" | "workplace" | "service";
+
+interface BuildingConfig {
+  type: BuildingType;
+  category: BuildingCategory;
+  emoji: string;
+  displayName: string;
+  color: { r: number; g: number; b: number };
+  shape: "box" | "cylinder" | "cone";
+  dimensions: {
+    width?: number;
+    height: number;
+    depth?: number;
+    diameter?: number;
+    diameterTop?: number;
+    diameterBottom?: number;
+  };
+  capacity: number; // Max workers/staff
+  clientCapacity?: number; // Max clients for service buildings
+  obstacleType: "box" | "cylinder";
+  obstacleParams: {
+    radius?: number;
+    width?: number;
+    depth?: number;
+    height: number;
+  };
+}
+
 interface Building {
   mesh: Mesh;
   entranceZone: Vector3;
-  type: "house" | "workplace" | "tavern" | "clinic" | "restaurant" | "bathhouse";
+  type: BuildingType;
   workers: number[]; // Array of worker agent indices assigned to this building (staff for service buildings)
   capacity: number; // Maximum workers/staff allowed
   clientCapacity?: number; // Maximum clients that can be served (for service buildings)
@@ -1853,6 +2111,86 @@ interface Worker {
   state: "sleeping" | "working" | "going_to_work" | "going_home" | "visiting_tavern" | "at_tavern" | "visiting_clinic" | "at_clinic" | "visiting_restaurant" | "at_restaurant" | "visiting_bathhouse" | "at_bathhouse";
   stateTimer: number;
 }
+
+// Building Configuration System
+const BUILDING_CONFIGS: Record<BuildingType, BuildingConfig> = {
+  house: {
+    type: "house",
+    category: "residential",
+    emoji: "🏠",
+    displayName: "House",
+    color: { r: 0.8, g: 0.6, b: 0.4 },
+    shape: "box",
+    dimensions: { width: 0.75, height: 0.5, depth: 0.75 },
+    capacity: 4,
+    obstacleType: "box",
+    obstacleParams: { width: 0.75, depth: 0.75, height: 0.5 }
+  },
+  workplace: {
+    type: "workplace",
+    category: "workplace",
+    emoji: "🏢",
+    displayName: "Workplace",
+    color: { r: 0.5, g: 0.5, b: 0.7 },
+    shape: "cylinder",
+    dimensions: { height: 0.75, diameter: 0.75 },
+    capacity: 5,
+    obstacleType: "cylinder",
+    obstacleParams: { radius: 0.375, height: 0.75 }
+  },
+  tavern: {
+    type: "tavern",
+    category: "service",
+    emoji: "🍺",
+    displayName: "Tavern",
+    color: { r: 0.7, g: 0.3, b: 0.3 },
+    shape: "cone",
+    dimensions: { height: 0.6, diameterTop: 0, diameterBottom: 0.75 },
+    capacity: 2,
+    clientCapacity: 20,
+    obstacleType: "cylinder",
+    obstacleParams: { radius: 0.375, height: 0.6 }
+  },
+  clinic: {
+    type: "clinic",
+    category: "service",
+    emoji: "🏥",
+    displayName: "Clinic",
+    color: { r: 0.3, g: 0.8, b: 0.3 },
+    shape: "box",
+    dimensions: { width: 0.8, height: 0.7, depth: 0.8 },
+    capacity: 4,
+    clientCapacity: 20,
+    obstacleType: "box",
+    obstacleParams: { width: 0.8, depth: 0.8, height: 0.7 }
+  },
+  restaurant: {
+    type: "restaurant",
+    category: "service",
+    emoji: "🍽️",
+    displayName: "Restaurant",
+    color: { r: 1.0, g: 0.7, b: 0.2 },
+    shape: "box",
+    dimensions: { width: 0.9, height: 0.6, depth: 0.75 },
+    capacity: 4,
+    clientCapacity: 20,
+    obstacleType: "box",
+    obstacleParams: { width: 0.9, depth: 0.75, height: 0.6 }
+  },
+  bathhouse: {
+    type: "bathhouse",
+    category: "service",
+    emoji: "🛁",
+    displayName: "Bathhouse",
+    color: { r: 0.4, g: 0.6, b: 0.9 },
+    shape: "cylinder",
+    dimensions: { height: 0.5, diameter: 0.8 },
+    capacity: 2,
+    clientCapacity: 20,
+    obstacleType: "cylinder",
+    obstacleParams: { radius: 0.4, height: 0.5 }
+  }
+};
 
 // Helper function to check if position is too close to existing buildings
 function isTooClose(pos: Vector3, existingPositions: Vector3[], minDistance: number): boolean {
@@ -2162,7 +2500,8 @@ function startSimulation(
   taverns: Building[],
   clinics: Building[],
   restaurants: Building[],
-  bathhouses: Building[]
+  bathhouses: Building[],
+  addAlert: (type: "critical" | "warning" | "info", icon: string, message: string) => void
 ) {
   console.log("Starting simulation with", workers.length, "workers");
 
@@ -2248,6 +2587,7 @@ function startSimulation(
           if (Math.random() < 0.005) {
             worker.health = Math.max(0, worker.health - 20);
             console.log(`🤒 Agent ${worker.agentIndex} got ill while sleeping! Health: ${worker.health}`);
+            addAlert("warning", "🤒", `Worker #${worker.agentIndex} got ill while sleeping! Health: ${worker.health.toFixed(0)}`);
           }
 
           if (worker.stateTimer > 5) {
@@ -2264,6 +2604,7 @@ function startSimulation(
                 console.log(`Agent ${worker.agentIndex} going to clinic (low health: ${worker.health})`);
               } else {
                 console.log(`⚠️ Agent ${worker.agentIndex} needs clinic but none are staffed!`);
+                addAlert("warning", "🏥", `Worker #${worker.agentIndex} needs clinic but none are staffed!`);
                 // Go to work anyway if no clinic available
                 if (worker.workplace) {
                   worker.state = "going_to_work";
@@ -2306,12 +2647,14 @@ function startSimulation(
           if (Math.random() < 0.02) {
             worker.health = Math.max(0, worker.health - 25);
             console.log(`⚠️ Agent ${worker.agentIndex} had a workplace accident! Health: ${worker.health}`);
+            addAlert("critical", "⚠️", `Worker #${worker.agentIndex} had a workplace accident! Health: ${worker.health.toFixed(0)}`);
           }
 
           // Random chance of getting ill - 1% chance per tick
           if (Math.random() < 0.01) {
             worker.health = Math.max(0, worker.health - 15);
             console.log(`🤒 Agent ${worker.agentIndex} got ill at work! Health: ${worker.health}`);
+            addAlert("warning", "🤒", `Worker #${worker.agentIndex} got ill at work! Health: ${worker.health.toFixed(0)}`);
           }
 
           if (worker.stateTimer > 10) {
@@ -2330,6 +2673,7 @@ function startSimulation(
                 console.log(`Agent ${worker.agentIndex} going to clinic from work (health: ${worker.health})`);
               } else {
                 console.log(`⚠️ Agent ${worker.agentIndex} needs clinic but none are staffed! Continuing work.`);
+                addAlert("warning", "🏥", `Worker #${worker.agentIndex} needs clinic but none are staffed!`);
               }
             }
             // 2. Hunger critical - go to restaurant
@@ -2345,6 +2689,7 @@ function startSimulation(
                 console.log(`Agent ${worker.agentIndex} going to restaurant (hunger: ${worker.hunger.toFixed(0)})`);
               } else {
                 console.log(`⚠️ Agent ${worker.agentIndex} is hungry but no restaurants are staffed!`);
+                addAlert("warning", "🍽️", `Worker #${worker.agentIndex} is hungry but no restaurants are staffed!`);
               }
             }
             // 3. Energy critical - go home to sleep
@@ -2374,6 +2719,7 @@ function startSimulation(
                 console.log(`Agent ${worker.agentIndex} going to bathhouse (hygiene: ${worker.hygiene.toFixed(0)})`);
               } else {
                 console.log(`⚠️ Agent ${worker.agentIndex} needs bathhouse but none are staffed!`);
+                addAlert("info", "🛁", `Worker #${worker.agentIndex} needs bathhouse but none are staffed!`);
               }
             }
             // 5. Social low or happiness low - go to tavern
@@ -2389,6 +2735,7 @@ function startSimulation(
                 console.log(`Agent ${worker.agentIndex} going to tavern (social: ${worker.social.toFixed(0)})`);
               } else {
                 console.log(`⚠️ Agent ${worker.agentIndex} needs tavern but none are staffed!`);
+                addAlert("info", "🍺", `Worker #${worker.agentIndex} needs tavern but none are staffed!`);
               }
             }
             // 6. All needs satisfied - go home
@@ -2581,6 +2928,7 @@ function startSimulation(
                 console.log(`Agent ${worker.agentIndex} going to restaurant after bathing`);
               } else {
                 console.log(`⚠️ Agent ${worker.agentIndex} is hungry but no restaurants are staffed!`);
+                addAlert("warning", "🍽️", `Worker #${worker.agentIndex} is hungry but no restaurants are staffed!`);
               }
             } else if (worker.social < 40 && taverns.length > 0) {
               // Find a staffed tavern with capacity
